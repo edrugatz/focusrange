@@ -118,6 +118,8 @@ main {
   line-height: 1.4;
   white-space: pre-wrap;
   word-break: break-word;
+  max-height: 40vh;
+  overflow-y: auto;
 }
 
 .controls {
@@ -193,7 +195,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus · <span id="ver">v11-25 16:30</span></span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 16:44</span></span>
   </header>
 
   <main>
@@ -206,6 +208,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
     <div class="progress hidden" id="progress"><div id="progressBar"></div></div>
     <div id="status" class="status">Hold the phone steady (resting it on something helps).</div>
     <pre id="diag" class="diag hidden"></pre>
+    <button id="copyLogBtn" class="small hidden">📋 Copy debug log</button>
 
     <button id="mainBtn" class="primary">📷 Start camera</button>
 
@@ -231,6 +234,52 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   </main>
 
   <script type="module">
+// ---- debug.js ----
+// Verbose debug log: camera capabilities, every focus command and Chrome's
+// answer, probe measurements and per-step sweep data. Shown in #diag and
+// copied with the "Copy debug log" button so it can be pasted for diagnosis.
+
+const dbgLines = [];
+const dbgStart = performance.now();
+let dbgListener = null;
+
+/** Adds a timestamped line; objects are JSON-encoded. */
+function dlog(...parts) {
+  const t = ((performance.now() - dbgStart) / 1000).toFixed(2).padStart(7);
+  const msg = parts.map((p) => (typeof p === 'string' ? p : dbgJson(p))).join(' ');
+  dbgLines.push(`${t}s ${msg}`);
+  dbgListener?.();
+}
+
+function dbgJson(v) {
+  try {
+    return JSON.stringify(v, (k, x) => (typeof x === 'number' && !Number.isInteger(x) ? Number(x.toFixed(4)) : x));
+  } catch {
+    return String(v);
+  }
+}
+
+function debugText() {
+  return dbgLines.join('\n');
+}
+
+function onDebugChange(fn) {
+  dbgListener = fn;
+}
+
+/** Short summary of what the track currently says about focus. */
+function focusState(track) {
+  if (!track?.getSettings) return 'no track';
+  const s = track.getSettings();
+  let c = {};
+  try {
+    c = track.getConstraints ? track.getConstraints() : {};
+  } catch {
+    /* ignore */
+  }
+  return `settings{mode:${s.focusMode ?? '?'}, dist:${s.focusDistance ?? '?'}, ${s.width}x${s.height}} constraints${dbgJson(c)}`;
+}
+
 // ---- focus.js ----
 // Focus measure + peak finding (depth from focus).
 
@@ -371,14 +420,23 @@ function findPeak(xs, ys) {
 // Wraps getUserMedia + the Image Capture focus constraints.
 
 const BASE = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+const camPause = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Different ways to ask for a manual focus distance. Browsers/phones differ in
 // which one they honour; "advanced" sets are *silently ignored* when any part
 // can't be satisfied, so probe.js checks which one really moves the lens.
+// "bare"/"twoStep" leave out the resolution constraints: re-sending them may
+// make Chrome reconfigure the camera, which can restart autofocus.
 const METHODS = {
   advanced: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual', focusDistance: d }] }),
   separate: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual' }, { focusDistance: d }] }),
   basic: (t, d) => t.applyConstraints({ ...BASE, focusMode: 'manual', focusDistance: d }),
+  bare: (t, d) => t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }] }),
+  twoStep: async (t, d) => {
+    await t.applyConstraints({ advanced: [{ focusMode: 'manual' }] });
+    await camPause(150);
+    await t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }] });
+  },
 };
 const FOCUS_METHODS = Object.keys(METHODS);
 
@@ -414,6 +472,10 @@ class Camera {
     this.caps = this.track.getCapabilities ? this.track.getCapabilities() : {};
     this.label = this.track.label || 'camera';
     this.deviceId = this.track.getSettings().deviceId || deviceId;
+    const { deviceId: _d, groupId: _g, ...caps } = this.caps;
+    dlog(`OPEN "${this.label}" video ${this.video.videoWidth}x${this.video.videoHeight}`);
+    dlog('  caps', caps);
+    dlog('  ', focusState(this.track));
   }
 
   stop() {
@@ -440,7 +502,14 @@ class Camera {
   }
 
   async setFocus(distance) {
-    await METHODS[this.method](this.track, distance);
+    const t0 = performance.now();
+    try {
+      await METHODS[this.method](this.track, distance);
+    } catch (e) {
+      dlog(`  setFocus[${this.method}](${distance}) REJECTED ${e.name}: ${e.message} ${e.constraint ? 'constraint=' + e.constraint : ''}`);
+      throw e;
+    }
+    dlog(`  setFocus[${this.method}](${dbgJson(distance)}) ok ${Math.round(performance.now() - t0)}ms → ${focusState(this.track)}`);
   }
 
   currentFocus() {
@@ -461,8 +530,9 @@ class Camera {
     if (!mode || !this.track) return;
     try {
       await this.track.applyConstraints({ ...BASE, advanced: [{ focusMode: mode }] });
-    } catch {
-      /* not critical */
+      dlog(`  restore AF (${mode}) → ${focusState(this.track)}`);
+    } catch (e) {
+      dlog(`  restore AF failed: ${e.name} ${e.message}`);
     }
   }
 
@@ -571,6 +641,7 @@ function drawChart(canvas, xs, ys, { peakX = null, currentX = null } = {}) {
 // ---- sweep.js ----
 // Builds a focus stack: [{gray, width, height, img, distance, diopter}], sorted far -> near.
 
+
 const grabCanvas = document.createElement('canvas');
 const gctx = grabCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -635,6 +706,7 @@ function plan({ min, max, step }, steps) {
 async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, onProgress }) {
   const dists = plan(camera.focusRange, steps);
   const frames = [];
+  dlog(`SWEEP "${camera.label}" method ${camera.method}, range ${dbgJson(camera.focusRange)}, ${dists.length} steps:`, dists);
 
   // Pre-position the lens and let it fully arrive before the first grab.
   // Autofocus has usually just focused on the subject, so a frame grabbed
@@ -643,6 +715,7 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, on
   await sleep(Math.max(1000, settleMs * 4));
   await camera.waitFrames(3);
 
+  const whole = [];
   for (let i = 0; i < dists.length; i++) {
     const dist = dists[i];
     onProgress?.(i, dists.length, dist);
@@ -657,18 +730,28 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, on
     f.distance = actual;
     f.diopter = 1 / actual;
     frames.push(f);
+    const s = sharpness(f.gray, f.width, f.height, f.width >> 1, f.height >> 1, Math.max(f.width, f.height));
+    whole.push(s);
+    dlog(`  step ${i + 1}: asked ${dist.toFixed(3)} m, reported ${reported ?? '?'}, whole-frame sharpness ${s.toFixed(2)}`);
   }
+  const hi = Math.max(...whole);
+  const lo = Math.min(...whole);
+  dlog(`SWEEP done: whole-frame sharpness ${lo.toFixed(2)}–${hi.toFixed(2)} (×${(hi / Math.max(lo, 1e-9)).toFixed(2)}; ~×1.0 means the lens never moved)`);
   onProgress?.(dists.length, dists.length, null);
   return frames.sort((a, b) => a.diopter - b.diopter);
 }
 
 // ---- probe.js ----
 // Checks that focus commands really move the lens: whole-frame sharpness is
-// measured at near and far focus. If it barely changes, the command is being
-// ignored, so other command styles and other back cameras are tried.
+// measured alternately at far and near focus (far, near, far, near). The
+// change must be consistent on every switch and clearly above the far-vs-far
+// noise, otherwise exposure drift or a shaky hand could fake a "pass".
+// Every command style is tried; other back cameras only if none works.
+
 
 
 const MIN_RATIO = 1.3; // near/far sharpness change that proves the lens moves
+const NOISE_MARGIN = 1.15; // the change must also beat the noise by this factor
 
 const probeCanvas = document.createElement('canvas');
 const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
@@ -688,39 +771,66 @@ async function sharpnessAt(camera, dist) {
   await camera.setFocus(dist);
   await wait(900);
   await camera.waitFrames(3);
-  let s = 0;
+  const vals = [];
   for (let k = 0; k < 3; k++) {
-    s += frameSharpness(camera.video);
+    vals.push(frameSharpness(camera.video));
     await camera.waitFrames(1);
   }
-  return s / 3;
+  const s = vals.reduce((a, b) => a + b, 0) / vals.length;
+  dlog(`    sharpness @${dist} m = ${s.toFixed(2)} (frames ${vals.map((v) => v.toFixed(2)).join(', ')})`);
+  return s;
 }
 
-/** Tries each focus command style on the open camera. */
-async function testCamera(camera, log) {
+const ratioOf = (a, b) => Math.max(a, b) / Math.max(1e-9, Math.min(a, b));
+
+/** Tests one command style; returns {method, score, ok, summary}. */
+async function testMethod(camera, method, near, far) {
+  camera.method = method;
+  dlog(`  -- method ${method}: far ${far} m / near ${near} m`);
+  try {
+    const f1 = await sharpnessAt(camera, far);
+    const n1 = await sharpnessAt(camera, near);
+    const f2 = await sharpnessAt(camera, far);
+    const n2 = await sharpnessAt(camera, near);
+    const switches = [ratioOf(f1, n1), ratioOf(n1, f2), ratioOf(f2, n2)];
+    const sameDir = Math.sign(n1 - f1) === Math.sign(n1 - f2) && Math.sign(n2 - f2) === Math.sign(n1 - f1);
+    const noise = ratioOf(f1, f2);
+    const score = sameDir ? Math.min(...switches) : 1;
+    const ok = score >= MIN_RATIO && score >= noise * NOISE_MARGIN;
+    const summary = `switches ×${switches.map((r) => r.toFixed(2)).join('/×')}, noise ×${noise.toFixed(2)}, ${sameDir ? 'consistent' : 'INCONSISTENT'} → ${ok ? 'WORKS' : 'no effect'}`;
+    dlog(`  == ${method}: ${summary}`);
+    return { method, score, ok, summary };
+  } catch (e) {
+    dlog(`  == ${method}: error ${e.name || ''} ${e.message || ''}`);
+    return { method, score: 0, ok: false, summary: `error ${e.name || ''}` };
+  } finally {
+    await camera.restoreAutoFocus();
+    await wait(600);
+  }
+}
+
+/** Tries every command style on the open camera; returns the best result or null. */
+async function testCamera(camera, log, onStatus) {
   const r = camera.focusRange;
   const name = camera.label || 'camera';
   if (!r) {
     const modes = (camera.caps.focusMode || []).join('/') || 'none';
     log.push(`${name}: no manual focus (modes: ${modes})`);
-    return false;
+    dlog(`${name}: no manual focus (modes: ${modes})`);
+    return null;
   }
-  const near = r.min;
+  const near = Math.max(r.min, 0.1);
   const far = Math.min(r.max, 10);
-  for (const method of FOCUS_METHODS) {
-    camera.method = method;
-    try {
-      const a = await sharpnessAt(camera, near);
-      const reportNear = camera.focusReport();
-      const b = await sharpnessAt(camera, far);
-      const ratio = Math.max(a, b) / Math.max(1e-9, Math.min(a, b));
-      log.push(`${name} [${method}]: change ×${ratio.toFixed(2)} (reports ${reportNear} → ${camera.focusReport()})`);
-      if (ratio >= MIN_RATIO) return true;
-    } catch (e) {
-      log.push(`${name} [${method}]: ${e.name || 'error'} ${e.message || ''}`.trim());
-    }
+  dlog(`TEST "${name}" range ${r.min}–${r.max} step ${r.step}`);
+  let best = null;
+  for (let i = 0; i < FOCUS_METHODS.length; i++) {
+    const method = FOCUS_METHODS[i];
+    onStatus?.(`Testing focus: ${name}, method ${i + 1}/${FOCUS_METHODS.length}…`);
+    const res = await testMethod(camera, method, near, far);
+    log.push(`${name} [${method}]: ${res.summary}`);
+    if (res.ok && (!best || res.score > best.score)) best = res;
   }
-  return false;
+  return best;
 }
 
 /**
@@ -729,11 +839,11 @@ async function testCamera(camera, log) {
  */
 async function findWorkingFocus(camera, onStatus) {
   const log = [];
-  onStatus?.('Testing focus control…');
-  if (await testCamera(camera, log)) return { ok: true, log };
-
+  dlog(`PROBE start: methods ${FOCUS_METHODS.join(', ')}`);
   const firstId = camera.deviceId;
-  const firstMethod = 'advanced';
+  let best = await testCamera(camera, log, onStatus);
+  if (best) return finish(camera, best, log);
+
   let cams = [];
   try {
     cams = (await Camera.backCameras()).filter((c) => c.deviceId && c.deviceId !== firstId);
@@ -746,21 +856,32 @@ async function findWorkingFocus(camera, onStatus) {
       await camera.start(cams[i].deviceId);
     } catch (e) {
       log.push(`${cams[i].label || 'camera'}: could not open (${e.name})`);
+      dlog(`${cams[i].label || 'camera'}: could not open (${e.name} ${e.message})`);
       continue;
     }
-    if (await testCamera(camera, log)) return { ok: true, log };
+    best = await testCamera(camera, log, onStatus);
+    if (best) return finish(camera, best, log);
   }
 
+  dlog('PROBE: no camera/method moved the lens');
   try {
     await camera.start(firstId);
   } catch {
     await camera.start();
   }
-  camera.method = firstMethod;
+  camera.method = 'bare';
   return { ok: false, log };
 }
 
+function finish(camera, best, log) {
+  camera.method = best.method;
+  dlog(`PROBE chose "${camera.label}" method ${best.method} (score ×${best.score.toFixed(2)})`);
+  log.push(`→ using ${best.method}`);
+  return { ok: true, log };
+}
+
 // ---- main.js ----
+
 
 
 
@@ -780,6 +901,7 @@ const el = {
   hint: $('hint'),
   status: $('status'),
   diag: $('diag'),
+  copyLogBtn: $('copyLogBtn'),
   progress: $('progress'),
   progressBar: $('progressBar'),
   mainBtn: $('mainBtn'),
@@ -838,11 +960,61 @@ async function onMainBtn() {
   return runSweep();
 }
 
+/* ---------- debug log ---------- */
+
+let logQueued = false;
+onDebugChange(() => {
+  if (logQueued) return;
+  logQueued = true;
+  requestAnimationFrame(() => {
+    logQueued = false;
+    const atBottom = el.diag.scrollTop + el.diag.clientHeight >= el.diag.scrollHeight - 30;
+    el.diag.textContent = debugText();
+    if (atBottom) el.diag.scrollTop = el.diag.scrollHeight;
+  });
+});
+
+function showLog() {
+  el.diag.classList.remove('hidden');
+  el.copyLogBtn.classList.remove('hidden');
+}
+
+async function copyLog() {
+  const text = debugText();
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // fallback: select the log so it can be copied by hand
+    const range = document.createRange();
+    range.selectNodeContents(el.diag);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    el.copyLogBtn.textContent = 'Selected — copy it manually';
+    return;
+  }
+  el.copyLogBtn.textContent = `✓ Copied (${text.split('\n').length} lines)`;
+  setTimeout(() => (el.copyLogBtn.textContent = '📋 Copy debug log'), 2500);
+}
+
+async function logEnvironment() {
+  dlog(`ENV ${$('ver').textContent} | ${navigator.userAgent}`);
+  dlog(`  ImageCapture: ${'ImageCapture' in window}, screen ${screen.width}x${screen.height} @${devicePixelRatio}`);
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+    devs.forEach((d, i) => dlog(`  video device ${i}: "${d.label}"`));
+  } catch (e) {
+    dlog(`  enumerateDevices failed: ${e.name}`);
+  }
+}
+
 async function startCamera() {
   setStatus('Starting camera…');
+  showLog();
   try {
     await camera.start();
+    await logEnvironment();
   } catch (e) {
+    dlog(`camera start failed: ${e.name}: ${e.message}`);
     camera.stop();
     setStatus(
       e.name === 'NotAllowedError' ? 'Camera access was blocked. Allow camera access for this site and reload.' : `Camera error: ${e.name}: ${e.message}`,
@@ -864,8 +1036,7 @@ async function startCamera() {
   await camera.restoreAutoFocus();
   busy = false;
   el.mainBtn.disabled = false;
-  el.diag.textContent = probe.log.join('\n');
-  el.diag.classList.remove('hidden');
+  dlog(`PROBE summary:\n  ${probe.log.join('\n  ')}`);
 
   if (!probe.ok) {
     setStatus(
@@ -896,6 +1067,7 @@ async function runSweep() {
       },
     });
   } catch (e) {
+    dlog(`SWEEP failed: ${e.name}: ${e.message}`);
     setStatus(`Sweep failed: ${e.message}`, 'err');
     return;
   } finally {
@@ -999,6 +1171,7 @@ function onCanvasTap(e) {
 
 el.mainBtn.addEventListener('click', onMainBtn);
 el.canvas.addEventListener('click', onCanvasTap);
+el.copyLogBtn.addEventListener('click', copyLog);
 el.frameSlider.addEventListener('input', () => {
   current = Number(el.frameSlider.value);
   drawFrame();
