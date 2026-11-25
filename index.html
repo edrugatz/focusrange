@@ -195,7 +195,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus · <span id="ver">v11-25 16:44</span></span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 17:42</span></span>
   </header>
 
   <main>
@@ -427,11 +427,12 @@ const camPause = (ms) => new Promise((r) => setTimeout(r, ms));
 // can't be satisfied, so probe.js checks which one really moves the lens.
 // "bare"/"twoStep" leave out the resolution constraints: re-sending them may
 // make Chrome reconfigure the camera, which can restart autofocus.
+// (Plain top-level focus constraints are always rejected by Chrome: "Mixing
+// ImageCapture and non-ImageCapture constraints is not currently supported".)
 const METHODS = {
+  bare: (t, d) => t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }] }),
   advanced: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual', focusDistance: d }] }),
   separate: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual' }, { focusDistance: d }] }),
-  basic: (t, d) => t.applyConstraints({ ...BASE, focusMode: 'manual', focusDistance: d }),
-  bare: (t, d) => t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }] }),
   twoStep: async (t, d) => {
     await t.applyConstraints({ advanced: [{ focusMode: 'manual' }] });
     await camPause(150);
@@ -448,7 +449,7 @@ class Camera {
     this.caps = {};
     this.label = '';
     this.deviceId = null;
-    this.method = 'advanced';
+    this.method = 'bare';
   }
 
   get active() {
@@ -499,6 +500,18 @@ class Camera {
     if (!fd || !modes.includes('manual')) return null;
     if (!(fd.max > fd.min)) return null;
     return { min: fd.min, max: fd.max, step: fd.step || 0 };
+  }
+
+  /**
+   * Fixed-focus lenses (e.g. ultra-wide) still list focusMode "manual" and
+   * accept every command, but nothing moves. They offer no autofocus mode and
+   * report an absurd max distance (seen: 9.2e18 m), so skip those.
+   */
+  get hasFocusMotor() {
+    const modes = this.caps.focusMode || [];
+    const fd = this.caps.focusDistance;
+    const hasAF = modes.includes('continuous') || modes.includes('single-shot');
+    return !!this.focusRange && hasAF && Number.isFinite(fd.max) && fd.max < 1000;
   }
 
   async setFocus(distance) {
@@ -809,40 +822,60 @@ async function testMethod(camera, method, near, far) {
   }
 }
 
-/** Tries every command style on the open camera; returns the best result or null. */
-async function testCamera(camera, log, onStatus) {
+/**
+ * Tests command styles on the open camera (preferred one first) and stops at
+ * the first that really moves the lens. Returns that result or null.
+ */
+async function testCamera(camera, log, onStatus, preferred) {
   const r = camera.focusRange;
   const name = camera.label || 'camera';
-  if (!r) {
+  if (!camera.hasFocusMotor) {
     const modes = (camera.caps.focusMode || []).join('/') || 'none';
-    log.push(`${name}: no manual focus (modes: ${modes})`);
-    dlog(`${name}: no manual focus (modes: ${modes})`);
+    const max = camera.caps.focusDistance?.max;
+    const msg = `${name}: fixed focus, skipped (modes: ${modes}, max ${max ?? '?'} m)`;
+    log.push(msg);
+    dlog(msg);
     return null;
   }
   const near = Math.max(r.min, 0.1);
   const far = Math.min(r.max, 10);
   dlog(`TEST "${name}" range ${r.min}–${r.max} step ${r.step}`);
-  let best = null;
-  for (let i = 0; i < FOCUS_METHODS.length; i++) {
-    const method = FOCUS_METHODS[i];
-    onStatus?.(`Testing focus: ${name}, method ${i + 1}/${FOCUS_METHODS.length}…`);
-    const res = await testMethod(camera, method, near, far);
-    log.push(`${name} [${method}]: ${res.summary}`);
-    if (res.ok && (!best || res.score > best.score)) best = res;
+  const methods = preferred ? [preferred, ...FOCUS_METHODS.filter((m) => m !== preferred)] : FOCUS_METHODS;
+  for (let i = 0; i < methods.length; i++) {
+    onStatus?.(`Testing focus on ${name} (${i + 1}/${methods.length})…`);
+    const res = await testMethod(camera, methods[i], near, far);
+    log.push(`${name} [${methods[i]}]: ${res.summary}`);
+    if (res.ok) return res;
   }
-  return best;
+  return null;
+}
+
+const SAVED_KEY = 'focusrange.camera';
+
+/** {deviceId, method} of the camera that worked last time, or null. */
+function loadSavedCamera() {
+  try {
+    const v = JSON.parse(localStorage.getItem(SAVED_KEY));
+    return v?.deviceId && FOCUS_METHODS.includes(v.method) ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Finds a camera + command style where focus visibly changes.
- * Returns {ok, log}. On failure the originally opened camera is reopened.
+ * Finds a camera + command style where focus visibly changes, starting with
+ * the open camera, then the other back cameras. Cameras without a focus motor
+ * are skipped. Returns {ok, log}; on failure the first camera is reopened.
  */
 async function findWorkingFocus(camera, onStatus) {
   const log = [];
-  dlog(`PROBE start: methods ${FOCUS_METHODS.join(', ')}`);
+  const saved = loadSavedCamera();
+  dlog(`PROBE start: methods ${FOCUS_METHODS.join(', ')}; saved ${saved ? saved.method : 'none'}`);
   const firstId = camera.deviceId;
-  let best = await testCamera(camera, log, onStatus);
-  if (best) return finish(camera, best, log);
+  const pref = (id) => (saved && saved.deviceId === id ? saved.method : null);
+
+  let best = await testCamera(camera, log, onStatus, pref(camera.deviceId));
+  if (best) return probeDone(camera, best, log);
 
   let cams = [];
   try {
@@ -851,7 +884,7 @@ async function findWorkingFocus(camera, onStatus) {
     /* enumerate not available */
   }
   for (let i = 0; i < cams.length; i++) {
-    onStatus?.(`Focus didn't move. Trying camera ${i + 2}/${cams.length + 1}…`);
+    onStatus?.(`Looking for the camera with adjustable focus (${i + 2}/${cams.length + 1})…`);
     try {
       await camera.start(cams[i].deviceId);
     } catch (e) {
@@ -859,24 +892,33 @@ async function findWorkingFocus(camera, onStatus) {
       dlog(`${cams[i].label || 'camera'}: could not open (${e.name} ${e.message})`);
       continue;
     }
-    best = await testCamera(camera, log, onStatus);
-    if (best) return finish(camera, best, log);
+    best = await testCamera(camera, log, onStatus, pref(camera.deviceId));
+    if (best) return probeDone(camera, best, log);
   }
 
   dlog('PROBE: no camera/method moved the lens');
+  try {
+    localStorage.removeItem(SAVED_KEY);
+  } catch {
+    /* storage unavailable */
+  }
   try {
     await camera.start(firstId);
   } catch {
     await camera.start();
   }
-  camera.method = 'bare';
   return { ok: false, log };
 }
 
-function finish(camera, best, log) {
+function probeDone(camera, best, log) {
   camera.method = best.method;
   dlog(`PROBE chose "${camera.label}" method ${best.method} (score ×${best.score.toFixed(2)})`);
-  log.push(`→ using ${best.method}`);
+  log.push(`→ using ${camera.label} [${best.method}]`);
+  try {
+    localStorage.setItem(SAVED_KEY, JSON.stringify({ deviceId: camera.deviceId, method: best.method }));
+  } catch {
+    /* storage unavailable */
+  }
   return { ok: true, log };
 }
 
@@ -1011,7 +1053,16 @@ async function startCamera() {
   setStatus('Starting camera…');
   showLog();
   try {
-    await camera.start();
+    // reopen the camera whose focus worked last time (the default back
+    // camera can be a fixed-focus lens)
+    const saved = loadSavedCamera();
+    try {
+      await camera.start(saved?.deviceId || null);
+    } catch (e) {
+      if (!saved) throw e;
+      dlog(`saved camera failed to open (${e.name}); using default`);
+      await camera.start();
+    }
     await logEnvironment();
   } catch (e) {
     dlog(`camera start failed: ${e.name}: ${e.message}`);
