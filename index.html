@@ -180,7 +180,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus</span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 15:52</span></span>
   </header>
 
   <main>
@@ -536,14 +536,27 @@ const gctx = grabCanvas.getContext('2d', { willReadFrequently: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function grab(source, srcW, srcH, maxWidth) {
-  const scale = Math.min(1, maxWidth / srcW);
-  const w = Math.round(srcW * scale);
-  const h = Math.round(srcH * scale);
+/**
+ * Grabs `samples` consecutive new video frames and averages them. Sensor noise
+ * is independent from frame to frame, so averaging lowers the noise floor of
+ * the sharpness measure (≈ 1/√samples) and smooths the focus curve.
+ */
+async function grab(camera, maxWidth, samples) {
+  const video = camera.video;
+  const scale = Math.min(1, maxWidth / video.videoWidth);
+  const w = Math.round(video.videoWidth * scale);
+  const h = Math.round(video.videoHeight * scale);
   grabCanvas.width = w;
   grabCanvas.height = h;
-  gctx.drawImage(source, 0, 0, w, h);
-  const gray = toGray(gctx.getImageData(0, 0, w, h));
+  const sum = new Uint16Array(w * h);
+  for (let k = 0; k < samples; k++) {
+    if (k > 0) await camera.waitFrames(1);
+    gctx.drawImage(video, 0, 0, w, h);
+    const g = toGray(gctx.getImageData(0, 0, w, h));
+    for (let i = 0; i < g.length; i++) sum[i] += g[i];
+  }
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0; i < gray.length; i++) gray[i] = (sum[i] + (samples >> 1)) / samples;
   // keep a compact JPEG for display instead of full RGBA to save memory
   const blob = await new Promise((res) => grabCanvas.toBlob(res, 'image/jpeg', 0.85));
   const img = new Image();
@@ -579,9 +592,8 @@ function plan({ min, max, step }, steps) {
 }
 
 /** Steps the lens through its focus range and grabs a frame at each step. */
-async function captureSweep(camera, { steps, settleMs, maxWidth, onProgress }) {
+async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, onProgress }) {
   const dists = plan(camera.focusRange, steps);
-  const video = camera.video;
   const frames = [];
 
   // Pre-position the lens and let it fully arrive before the first grab.
@@ -601,7 +613,7 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, onProgress }) {
     await camera.waitFrames(2);
     const reported = camera.currentFocus();
     const actual = Number.isFinite(reported) && reported > 0 ? reported : dist;
-    const f = await grab(video, video.videoWidth, video.videoHeight, maxWidth);
+    const f = await grab(camera, maxWidth, samples);
     f.distance = actual;
     f.diopter = 1 / actual;
     frames.push(f);
@@ -620,6 +632,7 @@ const STEPS = 30; // focus steps per sweep
 const SETTLE_MS = 250; // wait after each lens move
 const RADIUS = 24; // half-size of the measuring window (frame px)
 const MAX_WIDTH = 1280; // analysis frame width
+const FRAMES_PER_STEP = 3; // frames averaged at each focus step (noise reduction)
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -718,6 +731,7 @@ async function runSweep() {
       steps: STEPS,
       settleMs: SETTLE_MS,
       maxWidth: MAX_WIDTH,
+      samples: FRAMES_PER_STEP,
       onProgress: (i, n, d) => {
         setProgress(i / n);
         if (d != null) setStatus(`Capturing ${i + 1}/${n} — focus at ${fmtDist(d)}. Keep still…`);
