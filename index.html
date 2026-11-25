@@ -184,21 +184,18 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   </header>
 
   <main>
-    <section class="viewer" id="viewer">
+    <section class="viewer">
       <video id="video" playsinline muted autoplay></video>
       <canvas id="frameCanvas" class="hidden"></canvas>
       <div id="hint" class="hint">Start the camera to begin</div>
     </section>
 
     <div class="progress hidden" id="progress"><div id="progressBar"></div></div>
-    <div id="status" class="status">Point the camera at your scene and hold it steady (a tripod helps).</div>
+    <div id="status" class="status">Hold the phone steady (resting it on something helps).</div>
 
-    <section class="controls" id="liveControls">
-      <button id="startBtn" class="primary">📷 Start camera</button>
-      <button id="sweepBtn" disabled>🎯 Focus sweep</button>
-    </section>
+    <button id="mainBtn" class="primary">📷 Start camera</button>
 
-    <section class="panel hidden" id="scrubPanel">
+    <section class="panel hidden" id="reviewPanel">
       <div class="field">
         <span>Frame <b id="frameLabel">–</b></span>
         <button id="newSweepBtn" class="small">↺ New sweep</button>
@@ -216,68 +213,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
         <span><i class="sw peak"></i>best focus</span>
         <span><i class="sw cur"></i>shown frame</span>
       </div>
-      <button id="calibrateBtn" class="small">📐 Calibrate with a known distance</button>
     </section>
-
-    <details class="panel" id="uploadPanel">
-      <summary>No manual focus? Analyze a focus-sweep video</summary>
-      <p class="note">Record a video with your camera app while pulling focus smoothly from one end to the other (camera steady). Enter the focus distances at the start and end of the clip; the app assumes the lens moved evenly in diopters.</p>
-      <button id="recordBtn" type="button">🎥 Record with camera app</button>
-      <input type="file" id="recordInput" accept="video/*" capture="environment" class="hidden" />
-      <label class="field">Or pick a video <input type="file" id="videoFile" accept="video/*" /></label>
-      <div class="note" id="videoChosen">No video selected.</div>
-      <label class="field">Focus at start (m) <input type="number" id="vStart" value="0.1" step="0.01" min="0.01" /></label>
-      <label class="field">Focus at end (m) <input type="number" id="vEnd" value="10" step="0.1" min="0.01" /></label>
-      <label class="field">Frames to sample <input type="number" id="vCount" value="30" step="1" min="5" max="80" /></label>
-      <button id="analyzeVideoBtn">🎞️ Analyze video</button>
-    </details>
-
-    <details class="panel" id="settingsPanel">
-      <summary>⚙️ Settings</summary>
-      <label class="field">Sweep steps <input type="number" id="sSteps" min="8" max="80" step="1" /></label>
-      <label class="field">Settle time per step (ms) <input type="number" id="sSettle" min="50" max="2000" step="50" /></label>
-      <label class="field">Measure window radius (px) <input type="number" id="sRadius" min="6" max="96" step="2" /></label>
-      <label class="field">Analysis width (px) <input type="number" id="sWidth" min="480" max="1920" step="160" /></label>
-      <div class="field">
-        <span>Calibration factor <b id="calibOut">1.000</b></span>
-        <button id="resetCalibBtn" class="small">Reset</button>
-      </div>
-      <div class="note" id="capsOut"></div>
-    </details>
-
-    <details class="panel">
-      <summary>ℹ️ How it works</summary>
-      <p class="note">The lens is stepped from near to far focus and a frame is grabbed at each step. When you tap a point, the app measures local sharpness (Sobel gradient energy) in a small window around it in every frame. The frame where that spot is sharpest tells you where the lens was focused. That focus distance is the distance to the point. The peak is refined with a Gaussian fit in diopters (1/m). Accuracy is best up close and drops fast with distance, because depth of field grows. Pick spots with texture or edges; flat, featureless areas give weak readings.</p>
-    </details>
   </main>
 
   <script type="module">
-// ---- settings.js ----
-// Persisted user settings.
-const KEY = 'focusrange.settings';
-
-const defaults = {
-  steps: 30,
-  settleMs: 250,
-  radius: 24,
-  maxWidth: 1280,
-  calib: 1,
-};
-
-function load() {
-  try {
-    return { ...defaults, ...JSON.parse(localStorage.getItem(KEY) || '{}') };
-  } catch {
-    return { ...defaults };
-  }
-}
-
-const settings = load();
-
-function saveSettings() {
-  localStorage.setItem(KEY, JSON.stringify(settings));
-}
-
 // ---- focus.js ----
 // Focus measure + peak finding (depth from focus).
 
@@ -337,14 +276,23 @@ function findPeak(xs, ys) {
   const n = ys.length;
   if (n < 3) return null;
 
-  // light [1 2 1] smoothing to suppress sensor noise
-  const s = ys.map((v, i) => {
-    if (i === 0 || i === n - 1) return v;
-    return (ys[i - 1] + 2 * v + ys[i + 1]) / 4;
-  });
+  // light [1 2 1] smoothing to suppress sensor noise. Edges use replicate
+  // padding so end points are smoothed like interior ones (leaving them raw
+  // made a noisy end frame beat a real, smoothed-down interior peak).
+  const s = ys.map((v, i) => (ys[Math.max(0, i - 1)] + 2 * v + ys[Math.min(n - 1, i + 1)]) / 4);
 
   let i = 0;
   for (let k = 1; k < n; k++) if (s[k] > s[i]) i = k;
+
+  // An end-point maximum only means "outside the swept range". If there is a
+  // real interior peak of similar height, trust that instead.
+  if (i === 0 || i === n - 1) {
+    let best = -1;
+    for (let k = 1; k < n - 1; k++) {
+      if (s[k] >= s[k - 1] && s[k] >= s[k + 1] && (best < 0 || s[k] > s[best])) best = k;
+    }
+    if (best >= 0 && s[best] >= 0.85 * s[i]) i = best;
+  }
 
   let peak = xs[i];
   if (i > 0 && i < n - 1) {
@@ -466,8 +414,9 @@ class Camera {
 }
 
 // ---- chart.js ----
-// Sharpness-vs-focus-distance plot. X axis is diopters (1/m), labelled in meters.
-const TICKS_M = [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1, 1.5, 2, 3, 5, 10, 20, 50];
+// Sharpness-vs-focus-distance plot. X axis is log(diopters), labelled in meters
+// (far on the left, near on the right).
+const TICKS_M = [0.02, 0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1, 1.5, 2, 3, 5, 10, 20, 50];
 
 function label(m) {
   return m < 1 ? `${Math.round(m * 100)}cm` : `${m}m`;
@@ -489,7 +438,11 @@ function drawChart(canvas, xs, ys, { peakX = null, currentX = null } = {}) {
   const maxX = Math.max(...xs);
   const maxY = Math.max(...ys) || 1;
   const minY = Math.min(...ys);
-  const px = (x) => pad.l + ((x - minX) / (maxX - minX || 1)) * (W - pad.l - pad.r);
+  // log scale: otherwise the few cm closest to the lens take up most of the width
+  const lg = (x) => Math.log(Math.max(x, 1e-3));
+  const lMin = lg(minX);
+  const lMax = lg(maxX);
+  const px = (x) => pad.l + ((lg(x) - lMin) / (lMax - lMin || 1)) * (W - pad.l - pad.r);
   const py = (y) => H - pad.b - ((y - minY) / (maxY - minY || 1)) * (H - pad.t - pad.b);
 
   // grid + distance ticks
@@ -573,33 +526,41 @@ function releaseFrames(frames) {
   frames.forEach((f) => URL.revokeObjectURL(f.img.src));
 }
 
-const byDiopter = (a, b) => a.diopter - b.diopter;
-
-/** Steps the lens through the focus range uniformly in diopters. */
-async function captureSweep(camera, { steps, settleMs, maxWidth, onProgress }) {
-  const { min, max, step } = camera.focusRange;
-  const near = Math.max(min, 0.02);
-  const far = Math.min(max, 1000);
-  const dNear = 1 / near;
-  const dFar = 1 / far;
-  const video = camera.video;
-  const frames = [];
-  const seen = new Set();
-
+/** Focus distances (m) for the sweep, uniform in diopters, near -> far, deduplicated. */
+function plan({ min, max, step }, steps) {
+  const dNear = 1 / Math.max(min, 0.02);
+  const dFar = 1 / Math.min(max, 1000);
+  const out = [];
   for (let i = 0; i < steps; i++) {
     const D = dNear + ((dFar - dNear) * i) / (steps - 1);
     let dist = Math.min(max, Math.max(min, 1 / D));
     if (step > 0) dist = Math.min(max, min + Math.round((dist - min) / step) * step);
-    const key = dist.toFixed(4);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (!out.some((d) => Math.abs(d - dist) < 1e-4)) out.push(dist);
+  }
+  return out;
+}
 
-    onProgress?.(i, steps, dist);
-    await camera.setFocus(dist);
-    // first move can travel the full lens range from the AF position
-    await sleep(i === 0 ? settleMs * 3 : settleMs);
+/** Steps the lens through its focus range and grabs a frame at each step. */
+async function captureSweep(camera, { steps, settleMs, maxWidth, onProgress }) {
+  const dists = plan(camera.focusRange, steps);
+  const video = camera.video;
+  const frames = [];
+
+  // Pre-position the lens and let it fully arrive before the first grab.
+  // Autofocus has usually just focused on the subject, so a frame grabbed
+  // before the lens has really moved looks sharp at the first (nearest) step.
+  await camera.setFocus(dists[0]);
+  await sleep(Math.max(1000, settleMs * 4));
+  await camera.waitFrames(3);
+
+  for (let i = 0; i < dists.length; i++) {
+    const dist = dists[i];
+    onProgress?.(i, dists.length, dist);
+    if (i > 0) {
+      await camera.setFocus(dist);
+      await sleep(settleMs);
+    }
     await camera.waitFrames(2);
-
     const reported = camera.currentFocus();
     const actual = Number.isFinite(reported) && reported > 0 ? reported : dist;
     const f = await grab(video, video.videoWidth, video.videoHeight, maxWidth);
@@ -607,50 +568,8 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, onProgress }) {
     f.diopter = 1 / actual;
     frames.push(f);
   }
-  onProgress?.(steps, steps, null);
-  return frames.sort(byDiopter);
-}
-
-function once(el, ev) {
-  return new Promise((resolve, reject) => {
-    const ok = () => { cleanup(); resolve(); };
-    const bad = () => { cleanup(); reject(new Error('Could not read this video file.')); };
-    const cleanup = () => { el.removeEventListener(ev, ok); el.removeEventListener('error', bad); };
-    el.addEventListener(ev, ok);
-    el.addEventListener('error', bad);
-  });
-}
-
-/** Samples a recorded focus-pull video; distances assumed linear in diopters over time. */
-async function sweepFromVideo(file, { startM, endM, count, maxWidth, onProgress }) {
-  const v = document.createElement('video');
-  v.muted = true;
-  v.playsInline = true;
-  v.preload = 'auto';
-  const url = URL.createObjectURL(file);
-  v.src = url;
-  try {
-    await once(v, 'loadeddata');
-    const duration = v.duration;
-    if (!Number.isFinite(duration) || duration <= 0) throw new Error('Video duration unknown; try an MP4 file.');
-    const dStart = 1 / startM;
-    const dEnd = 1 / endM;
-    const frames = [];
-    for (let i = 0; i < count; i++) {
-      const frac = (i + 0.5) / count;
-      onProgress?.(i, count, null);
-      v.currentTime = frac * duration;
-      await once(v, 'seeked');
-      const f = await grab(v, v.videoWidth, v.videoHeight, maxWidth);
-      f.diopter = dStart + (dEnd - dStart) * frac;
-      f.distance = 1 / f.diopter;
-      frames.push(f);
-    }
-    onProgress?.(count, count, null);
-    return frames.sort(byDiopter);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  onProgress?.(dists.length, dists.length, null);
+  return frames.sort((a, b) => a.diopter - b.diopter);
 }
 
 // ---- main.js ----
@@ -658,6 +577,11 @@ async function sweepFromVideo(file, { startM, endM, count, maxWidth, onProgress 
 
 
 
+// Tuning constants
+const STEPS = 30; // focus steps per sweep
+const SETTLE_MS = 250; // wait after each lens move
+const RADIUS = 24; // half-size of the measuring window (frame px)
+const MAX_WIDTH = 1280; // analysis frame width
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -667,10 +591,8 @@ const el = {
   status: $('status'),
   progress: $('progress'),
   progressBar: $('progressBar'),
-  startBtn: $('startBtn'),
-  sweepBtn: $('sweepBtn'),
-  liveControls: $('liveControls'),
-  scrubPanel: $('scrubPanel'),
+  mainBtn: $('mainBtn'),
+  reviewPanel: $('reviewPanel'),
   frameSlider: $('frameSlider'),
   frameLabel: $('frameLabel'),
   newSweepBtn: $('newSweepBtn'),
@@ -678,23 +600,6 @@ const el = {
   distanceOut: $('distanceOut'),
   resultMeta: $('resultMeta'),
   chart: $('chart'),
-  calibrateBtn: $('calibrateBtn'),
-  uploadPanel: $('uploadPanel'),
-  videoFile: $('videoFile'),
-  recordBtn: $('recordBtn'),
-  recordInput: $('recordInput'),
-  videoChosen: $('videoChosen'),
-  vStart: $('vStart'),
-  vEnd: $('vEnd'),
-  vCount: $('vCount'),
-  analyzeVideoBtn: $('analyzeVideoBtn'),
-  sSteps: $('sSteps'),
-  sSettle: $('sSettle'),
-  sRadius: $('sRadius'),
-  sWidth: $('sWidth'),
-  calibOut: $('calibOut'),
-  resetCalibBtn: $('resetCalibBtn'),
-  capsOut: $('capsOut'),
 };
 
 const camera = new Camera(el.video);
@@ -703,9 +608,8 @@ const ctx = el.canvas.getContext('2d');
 let frames = [];
 let current = 0;
 let point = null; // {x, y} in frame pixels
-let result = null; // {peak, values, rawDistance}
+let result = null; // {peak, values}
 let busy = false;
-let selectedVideo = null;
 
 /* ---------- helpers ---------- */
 
@@ -726,79 +630,56 @@ function fmtDist(m) {
   return `${m.toFixed(1)} m`;
 }
 
-function setBusy(b) {
-  busy = b;
-  el.startBtn.disabled = b;
-  el.sweepBtn.disabled = b || !camera.focusRange;
-  el.analyzeVideoBtn.disabled = b;
-  el.newSweepBtn.disabled = b;
-}
+/* ---------- live ---------- */
 
 function showLive() {
   el.video.classList.remove('hidden');
   el.canvas.classList.add('hidden');
-  el.liveControls.classList.remove('hidden');
-  el.scrubPanel.classList.add('hidden');
+  el.mainBtn.classList.remove('hidden');
+  el.reviewPanel.classList.add('hidden');
   el.resultPanel.classList.add('hidden');
   el.hint.classList.toggle('hidden', camera.active);
-  el.hint.textContent = 'Start the camera to begin';
 }
 
-/* ---------- camera ---------- */
+async function onMainBtn() {
+  if (busy) return;
+  if (!camera.active) return startCamera();
+  return runSweep();
+}
 
-async function toggleCamera() {
-  if (camera.active) {
-    camera.stop();
-    el.startBtn.textContent = '📷 Start camera';
-    el.sweepBtn.disabled = true;
-    el.hint.classList.remove('hidden');
-    setStatus('Camera stopped.');
-    return;
-  }
+async function startCamera() {
   setStatus('Starting camera…');
   try {
     await camera.start();
   } catch (e) {
     camera.stop();
-    if (e.name === 'NotAllowedError' || e.name === 'SecurityError') {
-      setStatus(
-        'Camera access was blocked without a prompt. This viewer does not allow live camera access. Use "Record with camera app" below to record a focus-pull video and analyze it.',
-        'err'
-      );
-      el.uploadPanel.open = true;
-    } else if (e.name === 'NotFoundError') {
-      setStatus('No camera was found.', 'err');
-    } else {
-      setStatus(`Camera error: ${e.name}: ${e.message}`, 'err');
-    }
+    setStatus(
+      e.name === 'NotAllowedError' ? 'Camera access was blocked. Allow camera access for this site and reload.' : `Camera error: ${e.name}: ${e.message}`,
+      'err'
+    );
     return;
   }
-  el.startBtn.textContent = '⏹ Stop camera';
   el.hint.classList.add('hidden');
   const r = camera.focusRange;
-  const s = camera.track.getSettings();
-  el.capsOut.textContent =
-    `Camera: ${s.width}×${s.height}. ` +
-    (r ? `focusDistance ${r.min}–${r.max} m (step ${r.step || 'any'}).` : 'No manual focusDistance capability.');
-  if (r) {
-    setStatus(`Manual focus available (${fmtDist(r.min)} – ${fmtDist(r.max)}). Hold steady and tap Focus sweep.`, 'ok');
-    el.sweepBtn.disabled = false;
-  } else {
-    setStatus('This camera/browser does not expose manual focus control. Use the focus-sweep video option below.', 'warn');
-    el.uploadPanel.open = true;
+  if (!r) {
+    setStatus('This camera/browser does not allow manual focus control, so a focus sweep is not possible.', 'err');
+    el.mainBtn.disabled = true;
+    return;
   }
+  el.mainBtn.textContent = '🎯 Capture focus sweep';
+  setStatus(`Manual focus ${fmtDist(r.min)} – ${fmtDist(r.max)}. Aim, hold steady, then capture.`, 'ok');
 }
 
 async function runSweep() {
-  if (busy || !camera.focusRange) return;
-  setBusy(true);
+  busy = true;
+  el.mainBtn.disabled = true;
   releaseFrames(frames);
   frames = [];
   try {
     frames = await captureSweep(camera, {
-      steps: settings.steps,
-      settleMs: settings.settleMs,
-      maxWidth: settings.maxWidth,
+      steps: STEPS,
+      settleMs: SETTLE_MS,
+      maxWidth: MAX_WIDTH,
       onProgress: (i, n, d) => {
         setProgress(i / n);
         if (d != null) setStatus(`Capturing ${i + 1}/${n} — focus at ${fmtDist(d)}. Keep still…`);
@@ -810,38 +691,8 @@ async function runSweep() {
   } finally {
     await camera.restoreAutoFocus();
     setProgress(null);
-    setBusy(false);
-  }
-  enterReview();
-}
-
-async function analyzeVideo() {
-  const file = selectedVideo;
-  const startM = parseFloat(el.vStart.value);
-  const endM = parseFloat(el.vEnd.value);
-  const count = Math.max(5, Math.min(80, parseInt(el.vCount.value, 10) || 30));
-  if (!file) return setStatus('Choose a video first.', 'warn');
-  if (!(startM > 0 && endM > 0) || startM === endM) return setStatus('Enter two different positive focus distances.', 'warn');
-  setBusy(true);
-  releaseFrames(frames);
-  frames = [];
-  try {
-    frames = await sweepFromVideo(file, {
-      startM,
-      endM,
-      count,
-      maxWidth: settings.maxWidth,
-      onProgress: (i, n) => {
-        setProgress(i / n);
-        setStatus(`Reading frame ${Math.min(i + 1, n)}/${n}…`);
-      },
-    });
-  } catch (e) {
-    setStatus(`Video analysis failed: ${e.message}`, 'err');
-    return;
-  } finally {
-    setProgress(null);
-    setBusy(false);
+    busy = false;
+    el.mainBtn.disabled = false;
   }
   enterReview();
 }
@@ -850,7 +701,7 @@ async function analyzeVideo() {
 
 function enterReview() {
   if (frames.length < 3) {
-    setStatus('Too few distinct frames captured — try more steps.', 'err');
+    setStatus('Too few distinct focus steps captured.', 'err');
     return;
   }
   const f = frames[0];
@@ -858,8 +709,8 @@ function enterReview() {
   el.canvas.height = f.height;
   el.video.classList.add('hidden');
   el.canvas.classList.remove('hidden');
-  el.liveControls.classList.add('hidden');
-  el.scrubPanel.classList.remove('hidden');
+  el.mainBtn.classList.add('hidden');
+  el.reviewPanel.classList.remove('hidden');
   el.resultPanel.classList.add('hidden');
   el.frameSlider.max = String(frames.length - 1);
   current = Math.floor(frames.length / 2);
@@ -868,7 +719,7 @@ function enterReview() {
   result = null;
   el.hint.textContent = 'Tap the point to measure';
   el.hint.classList.remove('hidden');
-  setStatus(`Captured ${frames.length} frames from ${fmtDist(frames.at(-1).distance)} to ${fmtDist(frames[0].distance)}. Tap a textured point.`, 'ok');
+  setStatus(`Captured ${frames.length} frames. Tap a point with some texture or edges.`, 'ok');
   drawFrame();
 }
 
@@ -878,7 +729,7 @@ function drawFrame() {
   ctx.drawImage(f.img, 0, 0, f.width, f.height);
   el.frameLabel.textContent = `${current + 1}/${frames.length} · focus ${fmtDist(f.distance)}`;
   if (point) {
-    const r = settings.radius;
+    const r = RADIUS;
     const lw = Math.max(2, f.width / 400);
     ctx.lineWidth = lw * 2;
     ctx.strokeStyle = 'rgba(0,0,0,0.6)';
@@ -886,16 +737,6 @@ function drawFrame() {
     ctx.lineWidth = lw;
     ctx.strokeStyle = '#ffb347';
     ctx.strokeRect(point.x - r, point.y - r, 2 * r, 2 * r);
-    ctx.beginPath();
-    ctx.moveTo(point.x - r * 1.6, point.y);
-    ctx.lineTo(point.x - r * 0.4, point.y);
-    ctx.moveTo(point.x + r * 0.4, point.y);
-    ctx.lineTo(point.x + r * 1.6, point.y);
-    ctx.moveTo(point.x, point.y - r * 1.6);
-    ctx.lineTo(point.x, point.y - r * 0.4);
-    ctx.moveTo(point.x, point.y + r * 0.4);
-    ctx.lineTo(point.x, point.y + r * 1.6);
-    ctx.stroke();
   }
   if (result) renderChart();
 }
@@ -908,10 +749,10 @@ function renderChart() {
 }
 
 function measure() {
-  const values = sharpnessCurve(frames, point.x, point.y, settings.radius);
+  const values = sharpnessCurve(frames, point.x, point.y, RADIUS);
   const peak = findPeak(frames.map((f) => f.diopter), values);
   if (!peak) return;
-  result = { peak, values, rawDistance: peak.diopter > 0 ? 1 / peak.diopter : Infinity };
+  result = { peak, values };
   current = peak.index;
   el.frameSlider.value = String(current);
   el.hint.classList.add('hidden');
@@ -921,22 +762,16 @@ function measure() {
 }
 
 function renderResult() {
-  const { peak, rawDistance } = result;
-  const k = settings.calib;
-  const dist = rawDistance * k;
-  el.distanceOut.textContent = fmtDist(dist);
+  const { peak } = result;
+  el.distanceOut.textContent = fmtDist(peak.diopter > 0 ? 1 / peak.diopter : Infinity);
 
   const lo = peak.diopter + peak.halfStep;
   const hi = peak.diopter - peak.halfStep;
-  const nearB = (1 / lo) * k;
-  const farB = hi > 0 ? (1 / hi) * k : Infinity;
   const quality = peak.ratio > 3 ? 'good' : peak.ratio > 1.6 ? 'fair' : 'low';
-
-  let html = `Range ≈ ${fmtDist(nearB)} – ${fmtDist(farB)} · confidence <b>${quality}</b> (peak ×${peak.ratio.toFixed(1)})`;
-  if (k !== 1) html += ` · calibrated ×${k.toFixed(3)}`;
-  if (peak.edge === 'near') html += `<br><span class="warn">⚠ Sharpest at the nearest focus step — the point may be closer than the lens can focus.</span>`;
-  if (peak.edge === 'far') html += `<br><span class="warn">⚠ Sharpest at the farthest step — the point is at or beyond the far limit.</span>`;
-  if (quality === 'low') html += `<br><span class="warn">⚠ Weak focus peak: pick a spot with more texture/edges or enlarge the window.</span>`;
+  let html = `Range ≈ ${fmtDist(1 / lo)} – ${fmtDist(hi > 0 ? 1 / hi : Infinity)} · confidence <b>${quality}</b>`;
+  if (peak.edge === 'near') html += `<br><span class="warn">⚠ Sharpest at the nearest step: the point may be closer than the lens can focus.</span>`;
+  if (peak.edge === 'far') html += `<br><span class="warn">⚠ Sharpest at the farthest step: the point is at or beyond the far limit.</span>`;
+  if (quality === 'low') html += `<br><span class="warn">⚠ Weak focus peak: try a spot with more texture or edges.</span>`;
   el.resultMeta.innerHTML = html;
 }
 
@@ -950,79 +785,10 @@ function onCanvasTap(e) {
   measure();
 }
 
-function calibrate() {
-  if (!result || !Number.isFinite(result.rawDistance)) return;
-  const input = prompt('Actual distance to this point in meters (e.g. 0.75):');
-  if (input == null) return;
-  const actual = parseFloat(input.replace(',', '.'));
-  if (!(actual > 0)) return setStatus('Calibration needs a positive number in meters.', 'warn');
-  settings.calib = actual / result.rawDistance;
-  saveSettings();
-  syncSettingsUI();
-  renderResult();
-  setStatus(`Calibrated: factor ×${settings.calib.toFixed(3)} will be applied to future readings.`, 'ok');
-}
-
-/* ---------- settings ---------- */
-
-function syncSettingsUI() {
-  el.sSteps.value = settings.steps;
-  el.sSettle.value = settings.settleMs;
-  el.sRadius.value = settings.radius;
-  el.sWidth.value = settings.maxWidth;
-  el.calibOut.textContent = settings.calib.toFixed(3);
-}
-
-function bindSetting(input, key, min, max) {
-  input.addEventListener('change', () => {
-    const v = Math.round(Number(input.value));
-    if (!Number.isFinite(v)) return syncSettingsUI();
-    settings[key] = Math.min(max, Math.max(min, v));
-    saveSettings();
-    syncSettingsUI();
-    if (key === 'radius' && point && frames.length) measure();
-  });
-}
-
 /* ---------- events ---------- */
 
-el.startBtn.addEventListener('click', toggleCamera);
-el.sweepBtn.addEventListener('click', runSweep);
-el.analyzeVideoBtn.addEventListener('click', analyzeVideo);
-// Some embedded viewers silently ignore file pickers. A real picker hides or
-// blurs the page; if neither happens shortly after the tap, tell the user.
-function watchPicker() {
-  let opened = false;
-  const mark = () => (opened = true);
-  window.addEventListener('blur', mark, { once: true });
-  document.addEventListener('visibilitychange', mark, { once: true });
-  setTimeout(() => {
-    window.removeEventListener('blur', mark);
-    document.removeEventListener('visibilitychange', mark);
-    if (!opened) {
-      setStatus(
-        'The camera app / file picker did not open. This viewer blocks both camera and file access, so the app needs to run in a full browser such as Chrome.',
-        'err'
-      );
-      el.videoChosen.textContent = '⚠ Picker could not be opened in this viewer.';
-    }
-  }, 1500);
-}
-el.recordBtn.addEventListener('click', () => {
-  watchPicker();
-  el.recordInput.click();
-});
-el.videoFile.addEventListener('click', watchPicker);
-function chooseVideo(input) {
-  const file = input.files[0];
-  if (!file) return;
-  selectedVideo = file;
-  el.videoChosen.textContent = `Selected: ${file.name || 'recorded video'} (${(file.size / 1e6).toFixed(1)} MB). Set the start/end focus, then Analyze.`;
-}
-el.recordInput.addEventListener('change', () => chooseVideo(el.recordInput));
-el.videoFile.addEventListener('change', () => chooseVideo(el.videoFile));
+el.mainBtn.addEventListener('click', onMainBtn);
 el.canvas.addEventListener('click', onCanvasTap);
-el.calibrateBtn.addEventListener('click', calibrate);
 el.frameSlider.addEventListener('input', () => {
   current = Number(el.frameSlider.value);
   drawFrame();
@@ -1033,21 +799,10 @@ el.newSweepBtn.addEventListener('click', () => {
   result = null;
   point = null;
   showLive();
-  setStatus(camera.active ? 'Ready for a new sweep.' : 'Start the camera or analyze a video.');
-});
-el.resetCalibBtn.addEventListener('click', () => {
-  settings.calib = 1;
-  saveSettings();
-  syncSettingsUI();
-  if (result) renderResult();
+  setStatus('Aim, hold steady, then capture.', 'ok');
 });
 window.addEventListener('resize', () => result && renderChart());
 
-bindSetting(el.sSteps, 'steps', 8, 80);
-bindSetting(el.sSettle, 'settleMs', 50, 2000);
-bindSetting(el.sRadius, 'radius', 6, 96);
-bindSetting(el.sWidth, 'maxWidth', 480, 1920);
-syncSettingsUI();
 showLive();
 </script>
 </body>
