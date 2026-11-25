@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0e1116" />
+  <title>FocusRange – distance from focus</title>
+  <style>
+:root {
+  --bg: #0e1116;
+  --panel: #171b22;
+  --line: #2a313c;
+  --text: #e6e9ef;
+  --muted: #8b95a5;
+  --accent: #4cc2ff;
+  --peak: #ffb347;
+  --ok: #5bd68a;
+  --warn: #ffcc66;
+  --err: #ff6b6b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 12px 16px;
+  background: rgba(14, 17, 22, 0.92);
+  border-bottom: 1px solid var(--line);
+}
+header h1 { margin: 0; font-size: 1.2rem; }
+.tag { color: var(--muted); font-size: 0.8rem; }
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.viewer {
+  position: relative;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.viewer video,
+.viewer canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  touch-action: manipulation;
+}
+#frameCanvas { cursor: crosshair; }
+
+.hint {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.hidden { display: none !important; }
+
+.progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+#progressBar {
+  height: 100%;
+  width: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform 0.15s linear;
+}
+
+.status { font-size: 0.9rem; color: var(--muted); line-height: 1.4; }
+.status.ok { color: var(--ok); }
+.status.warn { color: var(--warn); }
+.status.err { color: var(--err); }
+
+.controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+button {
+  min-height: 48px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+}
+button.primary { background: var(--accent); color: #002233; border-color: transparent; }
+button.small { min-height: 38px; font-size: 0.85rem; font-weight: 500; }
+button:disabled { opacity: 0.4; }
+button:active:not(:disabled) { transform: scale(0.98); }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+details.panel { display: block; }
+details.panel > * + * { margin-top: 10px; }
+summary { cursor: pointer; font-weight: 600; }
+
+.field {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.92rem;
+}
+.field input[type="number"] {
+  width: 96px;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+.field input[type="file"] { max-width: 60%; color: var(--muted); font-size: 0.8rem; }
+
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+.note { margin: 0; color: var(--muted); font-size: 0.85rem; line-height: 1.45; }
+
+.result-label { color: var(--muted); font-size: 0.85rem; }
+.distance { font-size: 2.6rem; font-weight: 700; line-height: 1.1; }
+.meta { color: var(--muted); font-size: 0.88rem; line-height: 1.45; }
+.meta .warn { color: var(--warn); }
+
+#chart { width: 100%; height: 170px; display: block; }
+
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.78rem; color: var(--muted); }
+.sw { display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; }
+.sw.line { background: var(--accent); }
+.sw.peak { background: var(--peak); }
+.sw.cur { background: #fff; height: 8px; width: 8px; border-radius: 50%; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>📏 FocusRange</h1>
+    <span class="tag">depth from focus</span>
+  </header>
+
+  <main>
+    <section class="viewer" id="viewer">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="frameCanvas" class="hidden"></canvas>
+      <div id="hint" class="hint">Start the camera to begin</div>
+    </section>
+
+    <div class="progress hidden" id="progress"><div id="progressBar"></div></div>
+    <div id="status" class="status">Point the camera at your scene and hold it steady (a tripod helps).</div>
+
+    <section class="controls" id="liveControls">
+      <button id="startBtn" class="primary">📷 Start camera</button>
+      <button id="sweepBtn" disabled>🎯 Focus sweep</button>
+    </section>
+
+    <section class="panel hidden" id="scrubPanel">
+      <div class="field">
+        <span>Frame <b id="frameLabel">–</b></span>
+        <button id="newSweepBtn" class="small">↺ New sweep</button>
+      </div>
+      <input type="range" id="frameSlider" min="0" max="0" value="0" />
+    </section>
+
+    <section class="panel result hidden" id="resultPanel">
+      <div class="result-label">Estimated distance</div>
+      <div class="distance" id="distanceOut">–</div>
+      <div class="meta" id="resultMeta"></div>
+      <canvas id="chart"></canvas>
+      <div class="legend">
+        <span><i class="sw line"></i>sharpness</span>
+        <span><i class="sw peak"></i>best focus</span>
+        <span><i class="sw cur"></i>shown frame</span>
+      </div>
+      <button id="calibrateBtn" class="small">📐 Calibrate with a known distance</button>
+    </section>
+
+    <details class="panel" id="uploadPanel">
+      <summary>No manual focus? Analyze a focus-sweep video</summary>
+      <p class="note">Record a video with your camera app while pulling focus smoothly from one end to the other (camera steady). Enter the focus distances at the start and end of the clip; the app assumes the lens moved evenly in diopters.</p>
+      <button id="recordBtn" type="button">🎥 Record with camera app</button>
+      <input type="file" id="recordInput" accept="video/*" capture="environment" class="hidden" />
+      <label class="field">Or pick a video <input type="file" id="videoFile" accept="video/*" /></label>
+      <div class="note" id="videoChosen">No video selected.</div>
+      <label class="field">Focus at start (m) <input type="number" id="vStart" value="0.1" step="0.01" min="0.01" /></label>
+      <label class="field">Focus at end (m) <input type="number" id="vEnd" value="10" step="0.1" min="0.01" /></label>
+      <label class="field">Frames to sample <input type="number" id="vCount" value="30" step="1" min="5" max="80" /></label>
+      <button id="analyzeVideoBtn">🎞️ Analyze video</button>
+    </details>
+
+    <details class="panel" id="settingsPanel">
+      <summary>⚙️ Settings</summary>
+      <label class="field">Sweep steps <input type="number" id="sSteps" min="8" max="80" step="1" /></label>
+      <label class="field">Settle time per step (ms) <input type="number" id="sSettle" min="50" max="2000" step="50" /></label>
+      <label class="field">Measure window radius (px) <input type="number" id="sRadius" min="6" max="96" step="2" /></label>
+      <label class="field">Analysis width (px) <input type="number" id="sWidth" min="480" max="1920" step="160" /></label>
+      <div class="field">
+        <span>Calibration factor <b id="calibOut">1.000</b></span>
+        <button id="resetCalibBtn" class="small">Reset</button>
+      </div>
+      <div class="note" id="capsOut"></div>
+    </details>
+
+    <details class="panel">
+      <summary>ℹ️ How it works</summary>
+      <p class="note">The lens is stepped from near to far focus and a frame is grabbed at each step. When you tap a point, the app measures local sharpness (Sobel gradient energy) in a small window around it in every frame. The frame where that spot is sharpest tells you where the lens was focused. That focus distance is the distance to the point. The peak is refined with a Gaussian fit in diopters (1/m). Accuracy is best up close and drops fast with distance, because depth of field grows. Pick spots with texture or edges; flat, featureless areas give weak readings.</p>
+    </details>
+  </main>
+
+  <script type="module">
+// ---- settings.js ----
+// Persisted user settings.
+const KEY = 'focusrange.settings';
+
+const defaults = {
+  steps: 30,
+  settleMs: 250,
+  radius: 24,
+  maxWidth: 1280,
+  calib: 1,
+};
+
+function load() {
+  try {
+    return { ...defaults, ...JSON.parse(localStorage.getItem(KEY) || '{}') };
+  } catch {
+    return { ...defaults };
+  }
+}
+
+const settings = load();
+
+function saveSettings() {
+  localStorage.setItem(KEY, JSON.stringify(settings));
+}
+
+// ---- focus.js ----
+// Focus measure + peak finding (depth from focus).
+
+/** RGBA ImageData -> 8-bit luminance. */
+function toGray(imageData) {
+  const src = imageData.data;
+  const out = new Uint8ClampedArray(imageData.width * imageData.height);
+  for (let i = 0, j = 0; j < out.length; i += 4, j++) {
+    out[j] = (src[i] * 77 + src[i + 1] * 150 + src[i + 2] * 29) >> 8;
+  }
+  return out;
+}
+
+/**
+ * Tenengrad (Sobel gradient energy) in a (2r+1)^2 window around (cx, cy),
+ * normalised by mean brightness so auto-exposure changes between frames
+ * don't masquerade as focus changes.
+ */
+function sharpness(gray, w, h, cx, cy, r) {
+  const x0 = Math.max(1, cx - r);
+  const x1 = Math.min(w - 2, cx + r);
+  const y0 = Math.max(1, cy - r);
+  const y1 = Math.min(h - 2, cy + r);
+  let energy = 0;
+  let sum = 0;
+  let n = 0;
+  for (let y = y0; y <= y1; y++) {
+    const row = y * w;
+    for (let x = x0; x <= x1; x++) {
+      const i = row + x;
+      const tl = gray[i - w - 1], tc = gray[i - w], tr = gray[i - w + 1];
+      const ml = gray[i - 1], mr = gray[i + 1];
+      const bl = gray[i + w - 1], bc = gray[i + w], br = gray[i + w + 1];
+      const gx = tr + 2 * mr + br - tl - 2 * ml - bl;
+      const gy = bl + 2 * bc + br - tl - 2 * tc - tr;
+      energy += gx * gx + gy * gy;
+      sum += gray[i];
+      n++;
+    }
+  }
+  if (!n) return 0;
+  const mean = sum / n;
+  return energy / n / (mean * mean + 100);
+}
+
+function sharpnessCurve(frames, x, y, r) {
+  const cx = Math.round(x);
+  const cy = Math.round(y);
+  return frames.map((f) => sharpness(f.gray, f.width, f.height, cx, cy, r));
+}
+
+/**
+ * xs: diopters (ascending), ys: sharpness.
+ * Returns the refined diopter of best focus plus quality info.
+ */
+function findPeak(xs, ys) {
+  const n = ys.length;
+  if (n < 3) return null;
+
+  // light [1 2 1] smoothing to suppress sensor noise
+  const s = ys.map((v, i) => {
+    if (i === 0 || i === n - 1) return v;
+    return (ys[i - 1] + 2 * v + ys[i + 1]) / 4;
+  });
+
+  let i = 0;
+  for (let k = 1; k < n; k++) if (s[k] > s[i]) i = k;
+
+  let peak = xs[i];
+  if (i > 0 && i < n - 1) {
+    // Gaussian fit = parabola through log values (non-uniform spacing)
+    const [x0, x1, x2] = [xs[i - 1], xs[i], xs[i + 1]];
+    const [y0, y1, y2] = [s[i - 1], s[i], s[i + 1]].map((v) => Math.log(v + 1e-12));
+    const denom = (x0 - x1) * (x0 - x2) * (x1 - x2);
+    if (denom !== 0) {
+      const A = (x2 * (y1 - y0) + x1 * (y0 - y2) + x0 * (y2 - y1)) / denom;
+      const B = (x2 * x2 * (y0 - y1) + x1 * x1 * (y2 - y0) + x0 * x0 * (y1 - y2)) / denom;
+      if (A < 0) peak = Math.min(x2, Math.max(x0, -B / (2 * A)));
+    }
+  }
+
+  const sorted = [...s].sort((a, b) => a - b);
+  const median = sorted[Math.floor(n / 2)] || 1e-12;
+  const ratio = s[i] / median;
+
+  const spacing =
+    i > 0 && i < n - 1 ? (xs[i + 1] - xs[i - 1]) / 2 : Math.abs(xs[Math.min(i + 1, n - 1)] - xs[Math.max(i - 1, 0)]);
+
+  return {
+    index: i,
+    diopter: peak,
+    ratio,
+    halfStep: spacing / 2,
+    edge: i === 0 ? 'far' : i === n - 1 ? 'near' : null,
+    smoothed: s,
+  };
+}
+
+// ---- camera.js ----
+// Wraps getUserMedia + the Image Capture focus constraints.
+class Camera {
+  constructor(video) {
+    this.video = video;
+    this.stream = null;
+    this.track = null;
+    this.caps = {};
+  }
+
+  get active() {
+    return !!this.stream;
+  }
+
+  async start() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Camera API unavailable (needs HTTPS or localhost).');
+    }
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      },
+    });
+    this.video.srcObject = this.stream;
+    await this.video.play();
+    this.track = this.stream.getVideoTracks()[0];
+    // Some browsers only fill in capabilities once frames are flowing.
+    await this.waitFrames(2);
+    this.caps = this.track.getCapabilities ? this.track.getCapabilities() : {};
+  }
+
+  stop() {
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    this.track = null;
+    this.caps = {};
+    this.video.srcObject = null;
+  }
+
+  /** Returns {min, max, step} in meters, or null when manual focus isn't exposed. */
+  get focusRange() {
+    const fd = this.caps.focusDistance;
+    const modes = this.caps.focusMode || [];
+    if (!fd || !modes.includes('manual')) return null;
+    if (!(fd.max > fd.min)) return null;
+    return { min: fd.min, max: fd.max, step: fd.step || 0 };
+  }
+
+  async setFocus(distance) {
+    await this.track.applyConstraints({
+      advanced: [{ focusMode: 'manual', focusDistance: distance }],
+    });
+  }
+
+  currentFocus() {
+    const s = this.track?.getSettings ? this.track.getSettings() : {};
+    return s.focusDistance;
+  }
+
+  async restoreAutoFocus() {
+    const modes = this.caps.focusMode || [];
+    const mode = modes.includes('continuous') ? 'continuous' : modes.includes('single-shot') ? 'single-shot' : null;
+    if (!mode || !this.track) return;
+    try {
+      await this.track.applyConstraints({ advanced: [{ focusMode: mode }] });
+    } catch {
+      /* not critical */
+    }
+  }
+
+  /** Waits for n fresh video frames to be presented. */
+  waitFrames(n = 1) {
+    return new Promise((resolve) => {
+      let left = n;
+      const v = this.video;
+      const tick = () => {
+        if (--left <= 0) return resolve();
+        next();
+      };
+      const next = () =>
+        v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+      next();
+    });
+  }
+}
+
+// ---- chart.js ----
+// Sharpness-vs-focus-distance plot. X axis is diopters (1/m), labelled in meters.
+const TICKS_M = [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1, 1.5, 2, 3, 5, 10, 20, 50];
+
+function label(m) {
+  return m < 1 ? `${Math.round(m * 100)}cm` : `${m}m`;
+}
+
+function drawChart(canvas, xs, ys, { peakX = null, currentX = null } = {}) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  if (!xs.length) return;
+
+  const pad = { l: 8, r: 8, t: 10, b: 22 };
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys) || 1;
+  const minY = Math.min(...ys);
+  const px = (x) => pad.l + ((x - minX) / (maxX - minX || 1)) * (W - pad.l - pad.r);
+  const py = (y) => H - pad.b - ((y - minY) / (maxY - minY || 1)) * (H - pad.t - pad.b);
+
+  // grid + distance ticks
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.fillStyle = '#8b95a5';
+  ctx.strokeStyle = '#2a313c';
+  ctx.lineWidth = 1;
+  ctx.textAlign = 'center';
+  let lastLabelX = -Infinity;
+  for (const m of TICKS_M) {
+    const d = 1 / m;
+    if (d < minX || d > maxX) continue;
+    const x = px(d);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, H - pad.b);
+    ctx.stroke();
+    if (Math.abs(x - lastLabelX) > 34) {
+      ctx.fillText(label(m), x, H - 6);
+      lastLabelX = x;
+    }
+  }
+
+  // best-focus marker
+  if (peakX != null) {
+    ctx.strokeStyle = '#ffb347';
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(px(peakX), pad.t);
+    ctx.lineTo(px(peakX), H - pad.b);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // curve
+  ctx.strokeStyle = '#4cc2ff';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  xs.forEach((x, i) => (i ? ctx.lineTo(px(x), py(ys[i])) : ctx.moveTo(px(x), py(ys[i]))));
+  ctx.stroke();
+
+  // current frame
+  if (currentX != null) {
+    const i = xs.indexOf(currentX);
+    if (i >= 0) {
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(px(currentX), py(ys[i]), 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// ---- sweep.js ----
+// Builds a focus stack: [{gray, width, height, img, distance, diopter}], sorted far -> near.
+
+const grabCanvas = document.createElement('canvas');
+const gctx = grabCanvas.getContext('2d', { willReadFrequently: true });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function grab(source, srcW, srcH, maxWidth) {
+  const scale = Math.min(1, maxWidth / srcW);
+  const w = Math.round(srcW * scale);
+  const h = Math.round(srcH * scale);
+  grabCanvas.width = w;
+  grabCanvas.height = h;
+  gctx.drawImage(source, 0, 0, w, h);
+  const gray = toGray(gctx.getImageData(0, 0, w, h));
+  // keep a compact JPEG for display instead of full RGBA to save memory
+  const blob = await new Promise((res) => grabCanvas.toBlob(res, 'image/jpeg', 0.85));
+  const img = new Image();
+  img.src = URL.createObjectURL(blob);
+  await img.decode().catch(() => {});
+  return { gray, width: w, height: h, img };
+}
+
+function releaseFrames(frames) {
+  frames.forEach((f) => URL.revokeObjectURL(f.img.src));
+}
+
+const byDiopter = (a, b) => a.diopter - b.diopter;
+
+/** Steps the lens through the focus range uniformly in diopters. */
+async function captureSweep(camera, { steps, settleMs, maxWidth, onProgress }) {
+  const { min, max, step } = camera.focusRange;
+  const near = Math.max(min, 0.02);
+  const far = Math.min(max, 1000);
+  const dNear = 1 / near;
+  const dFar = 1 / far;
+  const video = camera.video;
+  const frames = [];
+  const seen = new Set();
+
+  for (let i = 0; i < steps; i++) {
+    const D = dNear + ((dFar - dNear) * i) / (steps - 1);
+    let dist = Math.min(max, Math.max(min, 1 / D));
+    if (step > 0) dist = Math.min(max, min + Math.round((dist - min) / step) * step);
+    const key = dist.toFixed(4);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    onProgress?.(i, steps, dist);
+    await camera.setFocus(dist);
+    // first move can travel the full lens range from the AF position
+    await sleep(i === 0 ? settleMs * 3 : settleMs);
+    await camera.waitFrames(2);
+
+    const reported = camera.currentFocus();
+    const actual = Number.isFinite(reported) && reported > 0 ? reported : dist;
+    const f = await grab(video, video.videoWidth, video.videoHeight, maxWidth);
+    f.distance = actual;
+    f.diopter = 1 / actual;
+    frames.push(f);
+  }
+  onProgress?.(steps, steps, null);
+  return frames.sort(byDiopter);
+}
+
+function once(el, ev) {
+  return new Promise((resolve, reject) => {
+    const ok = () => { cleanup(); resolve(); };
+    const bad = () => { cleanup(); reject(new Error('Could not read this video file.')); };
+    const cleanup = () => { el.removeEventListener(ev, ok); el.removeEventListener('error', bad); };
+    el.addEventListener(ev, ok);
+    el.addEventListener('error', bad);
+  });
+}
+
+/** Samples a recorded focus-pull video; distances assumed linear in diopters over time. */
+async function sweepFromVideo(file, { startM, endM, count, maxWidth, onProgress }) {
+  const v = document.createElement('video');
+  v.muted = true;
+  v.playsInline = true;
+  v.preload = 'auto';
+  const url = URL.createObjectURL(file);
+  v.src = url;
+  try {
+    await once(v, 'loadeddata');
+    const duration = v.duration;
+    if (!Number.isFinite(duration) || duration <= 0) throw new Error('Video duration unknown; try an MP4 file.');
+    const dStart = 1 / startM;
+    const dEnd = 1 / endM;
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      const frac = (i + 0.5) / count;
+      onProgress?.(i, count, null);
+      v.currentTime = frac * duration;
+      await once(v, 'seeked');
+      const f = await grab(v, v.videoWidth, v.videoHeight, maxWidth);
+      f.diopter = dStart + (dEnd - dStart) * frac;
+      f.distance = 1 / f.diopter;
+      frames.push(f);
+    }
+    onProgress?.(count, count, null);
+    return frames.sort(byDiopter);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+// ---- main.js ----
+
+
+
+
+
+const $ = (id) => document.getElementById(id);
+const el = {
+  video: $('video'),
+  canvas: $('frameCanvas'),
+  hint: $('hint'),
+  status: $('status'),
+  progress: $('progress'),
+  progressBar: $('progressBar'),
+  startBtn: $('startBtn'),
+  sweepBtn: $('sweepBtn'),
+  liveControls: $('liveControls'),
+  scrubPanel: $('scrubPanel'),
+  frameSlider: $('frameSlider'),
+  frameLabel: $('frameLabel'),
+  newSweepBtn: $('newSweepBtn'),
+  resultPanel: $('resultPanel'),
+  distanceOut: $('distanceOut'),
+  resultMeta: $('resultMeta'),
+  chart: $('chart'),
+  calibrateBtn: $('calibrateBtn'),
+  uploadPanel: $('uploadPanel'),
+  videoFile: $('videoFile'),
+  recordBtn: $('recordBtn'),
+  recordInput: $('recordInput'),
+  videoChosen: $('videoChosen'),
+  vStart: $('vStart'),
+  vEnd: $('vEnd'),
+  vCount: $('vCount'),
+  analyzeVideoBtn: $('analyzeVideoBtn'),
+  sSteps: $('sSteps'),
+  sSettle: $('sSettle'),
+  sRadius: $('sRadius'),
+  sWidth: $('sWidth'),
+  calibOut: $('calibOut'),
+  resetCalibBtn: $('resetCalibBtn'),
+  capsOut: $('capsOut'),
+};
+
+const camera = new Camera(el.video);
+const ctx = el.canvas.getContext('2d');
+
+let frames = [];
+let current = 0;
+let point = null; // {x, y} in frame pixels
+let result = null; // {peak, values, rawDistance}
+let busy = false;
+let selectedVideo = null;
+
+/* ---------- helpers ---------- */
+
+function setStatus(msg, kind = '') {
+  el.status.textContent = msg;
+  el.status.className = `status ${kind}`;
+}
+
+function setProgress(frac) {
+  el.progress.classList.toggle('hidden', frac == null);
+  if (frac != null) el.progressBar.style.transform = `scaleX(${frac})`;
+}
+
+function fmtDist(m) {
+  if (!Number.isFinite(m) || m <= 0 || m > 200) return '∞';
+  if (m < 1) return `${(m * 100).toFixed(m < 0.3 ? 1 : 0)} cm`;
+  if (m < 10) return `${m.toFixed(2)} m`;
+  return `${m.toFixed(1)} m`;
+}
+
+function setBusy(b) {
+  busy = b;
+  el.startBtn.disabled = b;
+  el.sweepBtn.disabled = b || !camera.focusRange;
+  el.analyzeVideoBtn.disabled = b;
+  el.newSweepBtn.disabled = b;
+}
+
+function showLive() {
+  el.video.classList.remove('hidden');
+  el.canvas.classList.add('hidden');
+  el.liveControls.classList.remove('hidden');
+  el.scrubPanel.classList.add('hidden');
+  el.resultPanel.classList.add('hidden');
+  el.hint.classList.toggle('hidden', camera.active);
+  el.hint.textContent = 'Start the camera to begin';
+}
+
+/* ---------- camera ---------- */
+
+async function toggleCamera() {
+  if (camera.active) {
+    camera.stop();
+    el.startBtn.textContent = '📷 Start camera';
+    el.sweepBtn.disabled = true;
+    el.hint.classList.remove('hidden');
+    setStatus('Camera stopped.');
+    return;
+  }
+  setStatus('Starting camera…');
+  try {
+    await camera.start();
+  } catch (e) {
+    camera.stop();
+    if (e.name === 'NotAllowedError' || e.name === 'SecurityError') {
+      setStatus(
+        'Camera access was blocked without a prompt. This viewer does not allow live camera access. Use "Record with camera app" below to record a focus-pull video and analyze it.',
+        'err'
+      );
+      el.uploadPanel.open = true;
+    } else if (e.name === 'NotFoundError') {
+      setStatus('No camera was found.', 'err');
+    } else {
+      setStatus(`Camera error: ${e.name}: ${e.message}`, 'err');
+    }
+    return;
+  }
+  el.startBtn.textContent = '⏹ Stop camera';
+  el.hint.classList.add('hidden');
+  const r = camera.focusRange;
+  const s = camera.track.getSettings();
+  el.capsOut.textContent =
+    `Camera: ${s.width}×${s.height}. ` +
+    (r ? `focusDistance ${r.min}–${r.max} m (step ${r.step || 'any'}).` : 'No manual focusDistance capability.');
+  if (r) {
+    setStatus(`Manual focus available (${fmtDist(r.min)} – ${fmtDist(r.max)}). Hold steady and tap Focus sweep.`, 'ok');
+    el.sweepBtn.disabled = false;
+  } else {
+    setStatus('This camera/browser does not expose manual focus control. Use the focus-sweep video option below.', 'warn');
+    el.uploadPanel.open = true;
+  }
+}
+
+async function runSweep() {
+  if (busy || !camera.focusRange) return;
+  setBusy(true);
+  releaseFrames(frames);
+  frames = [];
+  try {
+    frames = await captureSweep(camera, {
+      steps: settings.steps,
+      settleMs: settings.settleMs,
+      maxWidth: settings.maxWidth,
+      onProgress: (i, n, d) => {
+        setProgress(i / n);
+        if (d != null) setStatus(`Capturing ${i + 1}/${n} — focus at ${fmtDist(d)}. Keep still…`);
+      },
+    });
+  } catch (e) {
+    setStatus(`Sweep failed: ${e.message}`, 'err');
+    return;
+  } finally {
+    await camera.restoreAutoFocus();
+    setProgress(null);
+    setBusy(false);
+  }
+  enterReview();
+}
+
+async function analyzeVideo() {
+  const file = selectedVideo;
+  const startM = parseFloat(el.vStart.value);
+  const endM = parseFloat(el.vEnd.value);
+  const count = Math.max(5, Math.min(80, parseInt(el.vCount.value, 10) || 30));
+  if (!file) return setStatus('Choose a video first.', 'warn');
+  if (!(startM > 0 && endM > 0) || startM === endM) return setStatus('Enter two different positive focus distances.', 'warn');
+  setBusy(true);
+  releaseFrames(frames);
+  frames = [];
+  try {
+    frames = await sweepFromVideo(file, {
+      startM,
+      endM,
+      count,
+      maxWidth: settings.maxWidth,
+      onProgress: (i, n) => {
+        setProgress(i / n);
+        setStatus(`Reading frame ${Math.min(i + 1, n)}/${n}…`);
+      },
+    });
+  } catch (e) {
+    setStatus(`Video analysis failed: ${e.message}`, 'err');
+    return;
+  } finally {
+    setProgress(null);
+    setBusy(false);
+  }
+  enterReview();
+}
+
+/* ---------- review / measure ---------- */
+
+function enterReview() {
+  if (frames.length < 3) {
+    setStatus('Too few distinct frames captured — try more steps.', 'err');
+    return;
+  }
+  const f = frames[0];
+  el.canvas.width = f.width;
+  el.canvas.height = f.height;
+  el.video.classList.add('hidden');
+  el.canvas.classList.remove('hidden');
+  el.liveControls.classList.add('hidden');
+  el.scrubPanel.classList.remove('hidden');
+  el.resultPanel.classList.add('hidden');
+  el.frameSlider.max = String(frames.length - 1);
+  current = Math.floor(frames.length / 2);
+  el.frameSlider.value = String(current);
+  point = null;
+  result = null;
+  el.hint.textContent = 'Tap the point to measure';
+  el.hint.classList.remove('hidden');
+  setStatus(`Captured ${frames.length} frames from ${fmtDist(frames.at(-1).distance)} to ${fmtDist(frames[0].distance)}. Tap a textured point.`, 'ok');
+  drawFrame();
+}
+
+function drawFrame() {
+  const f = frames[current];
+  if (!f) return;
+  ctx.drawImage(f.img, 0, 0, f.width, f.height);
+  el.frameLabel.textContent = `${current + 1}/${frames.length} · focus ${fmtDist(f.distance)}`;
+  if (point) {
+    const r = settings.radius;
+    const lw = Math.max(2, f.width / 400);
+    ctx.lineWidth = lw * 2;
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.strokeRect(point.x - r, point.y - r, 2 * r, 2 * r);
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = '#ffb347';
+    ctx.strokeRect(point.x - r, point.y - r, 2 * r, 2 * r);
+    ctx.beginPath();
+    ctx.moveTo(point.x - r * 1.6, point.y);
+    ctx.lineTo(point.x - r * 0.4, point.y);
+    ctx.moveTo(point.x + r * 0.4, point.y);
+    ctx.lineTo(point.x + r * 1.6, point.y);
+    ctx.moveTo(point.x, point.y - r * 1.6);
+    ctx.lineTo(point.x, point.y - r * 0.4);
+    ctx.moveTo(point.x, point.y + r * 0.4);
+    ctx.lineTo(point.x, point.y + r * 1.6);
+    ctx.stroke();
+  }
+  if (result) renderChart();
+}
+
+function renderChart() {
+  drawChart(el.chart, frames.map((f) => f.diopter), result.values, {
+    peakX: result.peak.diopter,
+    currentX: frames[current].diopter,
+  });
+}
+
+function measure() {
+  const values = sharpnessCurve(frames, point.x, point.y, settings.radius);
+  const peak = findPeak(frames.map((f) => f.diopter), values);
+  if (!peak) return;
+  result = { peak, values, rawDistance: peak.diopter > 0 ? 1 / peak.diopter : Infinity };
+  current = peak.index;
+  el.frameSlider.value = String(current);
+  el.hint.classList.add('hidden');
+  el.resultPanel.classList.remove('hidden');
+  renderResult();
+  drawFrame();
+}
+
+function renderResult() {
+  const { peak, rawDistance } = result;
+  const k = settings.calib;
+  const dist = rawDistance * k;
+  el.distanceOut.textContent = fmtDist(dist);
+
+  const lo = peak.diopter + peak.halfStep;
+  const hi = peak.diopter - peak.halfStep;
+  const nearB = (1 / lo) * k;
+  const farB = hi > 0 ? (1 / hi) * k : Infinity;
+  const quality = peak.ratio > 3 ? 'good' : peak.ratio > 1.6 ? 'fair' : 'low';
+
+  let html = `Range ≈ ${fmtDist(nearB)} – ${fmtDist(farB)} · confidence <b>${quality}</b> (peak ×${peak.ratio.toFixed(1)})`;
+  if (k !== 1) html += ` · calibrated ×${k.toFixed(3)}`;
+  if (peak.edge === 'near') html += `<br><span class="warn">⚠ Sharpest at the nearest focus step — the point may be closer than the lens can focus.</span>`;
+  if (peak.edge === 'far') html += `<br><span class="warn">⚠ Sharpest at the farthest step — the point is at or beyond the far limit.</span>`;
+  if (quality === 'low') html += `<br><span class="warn">⚠ Weak focus peak: pick a spot with more texture/edges or enlarge the window.</span>`;
+  el.resultMeta.innerHTML = html;
+}
+
+function onCanvasTap(e) {
+  if (!frames.length || busy) return;
+  const rect = el.canvas.getBoundingClientRect();
+  point = {
+    x: ((e.clientX - rect.left) / rect.width) * el.canvas.width,
+    y: ((e.clientY - rect.top) / rect.height) * el.canvas.height,
+  };
+  measure();
+}
+
+function calibrate() {
+  if (!result || !Number.isFinite(result.rawDistance)) return;
+  const input = prompt('Actual distance to this point in meters (e.g. 0.75):');
+  if (input == null) return;
+  const actual = parseFloat(input.replace(',', '.'));
+  if (!(actual > 0)) return setStatus('Calibration needs a positive number in meters.', 'warn');
+  settings.calib = actual / result.rawDistance;
+  saveSettings();
+  syncSettingsUI();
+  renderResult();
+  setStatus(`Calibrated: factor ×${settings.calib.toFixed(3)} will be applied to future readings.`, 'ok');
+}
+
+/* ---------- settings ---------- */
+
+function syncSettingsUI() {
+  el.sSteps.value = settings.steps;
+  el.sSettle.value = settings.settleMs;
+  el.sRadius.value = settings.radius;
+  el.sWidth.value = settings.maxWidth;
+  el.calibOut.textContent = settings.calib.toFixed(3);
+}
+
+function bindSetting(input, key, min, max) {
+  input.addEventListener('change', () => {
+    const v = Math.round(Number(input.value));
+    if (!Number.isFinite(v)) return syncSettingsUI();
+    settings[key] = Math.min(max, Math.max(min, v));
+    saveSettings();
+    syncSettingsUI();
+    if (key === 'radius' && point && frames.length) measure();
+  });
+}
+
+/* ---------- events ---------- */
+
+el.startBtn.addEventListener('click', toggleCamera);
+el.sweepBtn.addEventListener('click', runSweep);
+el.analyzeVideoBtn.addEventListener('click', analyzeVideo);
+// Some embedded viewers silently ignore file pickers. A real picker hides or
+// blurs the page; if neither happens shortly after the tap, tell the user.
+function watchPicker() {
+  let opened = false;
+  const mark = () => (opened = true);
+  window.addEventListener('blur', mark, { once: true });
+  document.addEventListener('visibilitychange', mark, { once: true });
+  setTimeout(() => {
+    window.removeEventListener('blur', mark);
+    document.removeEventListener('visibilitychange', mark);
+    if (!opened) {
+      setStatus(
+        'The camera app / file picker did not open. This viewer blocks both camera and file access, so the app needs to run in a full browser such as Chrome.',
+        'err'
+      );
+      el.videoChosen.textContent = '⚠ Picker could not be opened in this viewer.';
+    }
+  }, 1500);
+}
+el.recordBtn.addEventListener('click', () => {
+  watchPicker();
+  el.recordInput.click();
+});
+el.videoFile.addEventListener('click', watchPicker);
+function chooseVideo(input) {
+  const file = input.files[0];
+  if (!file) return;
+  selectedVideo = file;
+  el.videoChosen.textContent = `Selected: ${file.name || 'recorded video'} (${(file.size / 1e6).toFixed(1)} MB). Set the start/end focus, then Analyze.`;
+}
+el.recordInput.addEventListener('change', () => chooseVideo(el.recordInput));
+el.videoFile.addEventListener('change', () => chooseVideo(el.videoFile));
+el.canvas.addEventListener('click', onCanvasTap);
+el.calibrateBtn.addEventListener('click', calibrate);
+el.frameSlider.addEventListener('input', () => {
+  current = Number(el.frameSlider.value);
+  drawFrame();
+});
+el.newSweepBtn.addEventListener('click', () => {
+  releaseFrames(frames);
+  frames = [];
+  result = null;
+  point = null;
+  showLive();
+  setStatus(camera.active ? 'Ready for a new sweep.' : 'Start the camera or analyze a video.');
+});
+el.resetCalibBtn.addEventListener('click', () => {
+  settings.calib = 1;
+  saveSettings();
+  syncSettingsUI();
+  if (result) renderResult();
+});
+window.addEventListener('resize', () => result && renderChart());
+
+bindSetting(el.sSteps, 'steps', 8, 80);
+bindSetting(el.sSettle, 'settleMs', 50, 2000);
+bindSetting(el.sRadius, 'radius', 6, 96);
+bindSetting(el.sWidth, 'maxWidth', 480, 1920);
+syncSettingsUI();
+showLive();
+</script>
+</body>
+</html>
