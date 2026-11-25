@@ -176,6 +176,17 @@ summary { cursor: pointer; font-weight: 600; }
 
 input[type="range"] { width: 100%; accent-color: var(--accent); }
 
+.btn-row { display: flex; gap: 8px; }
+
+.depth-legend { display: flex; flex-direction: column; gap: 4px; }
+.depth-bar { height: 12px; border-radius: 6px; }
+.depth-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
 .note { margin: 0; color: var(--muted); font-size: 0.85rem; line-height: 1.45; }
 
 .result-label { color: var(--muted); font-size: 0.85rem; }
@@ -195,7 +206,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus · <span id="ver">v11-25 17:42</span></span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 18:09</span></span>
   </header>
 
   <main>
@@ -214,8 +225,15 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 
     <section class="panel hidden" id="reviewPanel">
       <div class="field">
-        <span>Frame <b id="frameLabel">–</b></span>
-        <button id="newSweepBtn" class="small">↺ New sweep</button>
+        <span id="frameLabel">–</span>
+        <div class="btn-row">
+          <button id="viewBtn" class="small">📷 Photo</button>
+          <button id="newSweepBtn" class="small">↺ New</button>
+        </div>
+      </div>
+      <div id="depthLegend" class="depth-legend hidden">
+        <div class="depth-bar" id="depthBar"></div>
+        <div class="depth-labels"><span id="legNear">near</span><span id="legMid"></span><span id="legFar">far</span></div>
       </div>
       <input type="range" id="frameSlider" min="0" max="0" value="0" />
     </section>
@@ -922,7 +940,247 @@ function probeDone(camera, best, log) {
   return { ok: true, log };
 }
 
+// ---- depthmap.js ----
+// Depth map from the focus stack: the frame is split into cells, each cell's
+// sharpness curve across the sweep gives the frame index where it is in focus
+// (= its distance). Textureless cells have no reliable peak, so they get low
+// confidence and fade back to the plain photo instead of showing noise.
+
+const DM_TILE = 16; // analysis-frame pixels per depth cell
+const DM_CONF_MIN = 0.25; // cells below this don't vote in the outlier filter
+
+/** Turbo colormap (Google, polynomial approximation), x in 0..1 -> [r,g,b] 0..255. */
+function turbo(x) {
+  x = Math.min(1, Math.max(0, x));
+  const r = 0.13572138 + x * (4.6153926 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943))));
+  const g = 0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604))));
+  const b = 0.1066733 + x * (12.64194608 + x * (-60.58204836 + x * (110.36276771 + x * (-89.90310912 + x * 27.34824973))));
+  const c = (v) => Math.round(255 * Math.min(1, Math.max(0, v)));
+  return [c(r), c(g), c(b)];
+}
+
+/** t: 0 = far, 1 = near. Skips turbo's dark ends so colours stay vivid. */
+function depthColor(t) {
+  return turbo(0.08 + 0.86 * t);
+}
+
+/** Mean gradient energy per cell, normalised by brightness (like focus.js). */
+function cellEnergy(gray, w, h, gw, gh, out, off) {
+  for (let cy = 0; cy < gh; cy++) {
+    const y0 = Math.max(1, cy * DM_TILE);
+    const y1 = Math.min(h - 1, (cy + 1) * DM_TILE);
+    for (let cx = 0; cx < gw; cx++) {
+      const x0 = Math.max(1, cx * DM_TILE);
+      const x1 = Math.min(w - 1, (cx + 1) * DM_TILE);
+      let e = 0;
+      let s = 0;
+      let n = 0;
+      for (let y = y0; y < y1; y++) {
+        let i = y * w + x0;
+        for (let x = x0; x < x1; x++, i++) {
+          const gx = gray[i + 1] - gray[i - 1];
+          const gy = gray[i + w] - gray[i - w];
+          e += gx * gx + gy * gy;
+          s += gray[i];
+          n++;
+        }
+      }
+      const mean = n ? s / n : 0;
+      out[off + cy * gw + cx] = n ? e / n / (mean * mean + 100) : 0;
+    }
+  }
+}
+
+function median(arr) {
+  const s = Array.from(arr).sort((a, b) => a - b);
+  return s[s.length >> 1];
+}
+
+/**
+ * frames: sorted far -> near (ascending diopter), each {gray, width, height, diopter}.
+ * Returns {gw, gh, t, alpha, baseIndex, overlay} where t is 0 (far)..1 (near).
+ */
+function computeDepthMap(frames) {
+  const n = frames.length;
+  const { width: w, height: h } = frames[0];
+  const gw = Math.floor(w / DM_TILE);
+  const gh = Math.floor(h / DM_TILE);
+  const cells = gw * gh;
+
+  const energy = new Float32Array(n * cells);
+  frames.forEach((f, k) => cellEnergy(f.gray, w, h, gw, gh, energy, k * cells));
+
+  // sharpest frame overall = nicest photo to colour in
+  let baseIndex = 0;
+  let bestSum = -1;
+  for (let k = 0; k < n; k++) {
+    let sum = 0;
+    for (let c = 0; c < cells; c++) sum += energy[k * cells + c];
+    if (sum > bestSum) {
+      bestSum = sum;
+      baseIndex = k;
+    }
+  }
+
+  // per-cell focus peak (fractional frame index) + confidence
+  const idx = new Float32Array(cells);
+  const ratio = new Float32Array(cells);
+  const peakE = new Float32Array(cells);
+  const s = new Float32Array(n);
+  for (let c = 0; c < cells; c++) {
+    for (let k = 0; k < n; k++) {
+      const a = energy[Math.max(0, k - 1) * cells + c];
+      const b = energy[k * cells + c];
+      const d = energy[Math.min(n - 1, k + 1) * cells + c];
+      s[k] = (a + 2 * b + d) / 4;
+    }
+    let i = 0;
+    for (let k = 1; k < n; k++) if (s[k] > s[i]) i = k;
+    let frac = i;
+    if (i > 0 && i < n - 1) {
+      const den = s[i - 1] - 2 * s[i] + s[i + 1];
+      if (den < 0) frac = i + (0.5 * (s[i - 1] - s[i + 1])) / den;
+    }
+    idx[c] = frac;
+    ratio[c] = s[i] / (median(s) + 1e-12);
+    peakE[c] = s[i];
+  }
+
+  // confidence: a clear peak (ratio) on a cell with real texture (strength)
+  const strongE = median(peakE.filter((v, c) => ratio[c] > 1.5)) || median(peakE) || 1e-9;
+  const conf = new Float32Array(cells);
+  for (let c = 0; c < cells; c++) {
+    const peakiness = Math.min(1, Math.max(0, (ratio[c] - 1.3) / 1.2));
+    const strength = Math.min(1, peakE[c] / (0.15 * strongE));
+    conf[c] = peakiness * strength;
+  }
+
+  // 3x3 median of confident neighbours removes single-cell outliers
+  const clean = new Float32Array(idx);
+  const buf = [];
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      buf.length = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
+          const c = yy * gw + xx;
+          if (conf[c] >= DM_CONF_MIN) buf.push(idx[c]);
+        }
+      }
+      if (buf.length >= 3) clean[y * gw + x] = median(buf);
+    }
+  }
+
+  // confidence-weighted smoothing (2 passes): fills gaps from neighbours and
+  // softens the cell grid; alpha follows the local confidence
+  let t = new Float32Array(cells);
+  let alpha = new Float32Array(cells);
+  for (let c = 0; c < cells; c++) {
+    t[c] = clean[c] / (n - 1);
+    alpha[c] = conf[c];
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    const t2 = new Float32Array(cells);
+    const a2 = new Float32Array(cells);
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        let wt = 0;
+        let wv = 0;
+        let as = 0;
+        let an = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            const yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
+            const c = yy * gw + xx;
+            const k = (dx === 0 && dy === 0 ? 2 : 1) * (alpha[c] + 1e-4);
+            wt += k;
+            wv += k * t[c];
+            as += alpha[c];
+            an++;
+          }
+        }
+        const c = y * gw + x;
+        t2[c] = wv / wt;
+        a2[c] = 0.5 * alpha[c] + 0.5 * (as / an);
+      }
+    }
+    t = t2;
+    alpha = a2;
+  }
+
+  // small RGBA image of the map; scaled up with smoothing when drawn
+  const overlay = document.createElement('canvas');
+  overlay.width = gw;
+  overlay.height = gh;
+  const octx = overlay.getContext('2d');
+  const img = octx.createImageData(gw, gh);
+  for (let c = 0; c < cells; c++) {
+    const [r, g, b] = depthColor(t[c]);
+    img.data[c * 4] = r;
+    img.data[c * 4 + 1] = g;
+    img.data[c * 4 + 2] = b;
+    img.data[c * 4 + 3] = Math.round(255 * Math.min(1, alpha[c] * 1.4));
+  }
+  octx.putImageData(img, 0, 0);
+
+  return { gw, gh, t, alpha, baseIndex, overlay };
+}
+
+/**
+ * Draws the photo in grey with the depth colours blended in ("color" blend
+ * keeps the photo's detail). reveal 0..1 animates a top-down scan.
+ */
+function renderDepth(ctx, frames, map, reveal = 1) {
+  const f = frames[map.baseIndex];
+  const W = f.width;
+  const H = f.height;
+  ctx.save();
+  ctx.filter = 'grayscale(1) brightness(1.08) contrast(1.05)';
+  ctx.drawImage(f.img, 0, 0, W, H);
+  ctx.filter = 'none';
+
+  const cut = H * reveal;
+  ctx.beginPath();
+  ctx.rect(0, 0, W, cut);
+  ctx.clip();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.globalCompositeOperation = 'color';
+  ctx.drawImage(map.overlay, 0, 0, map.gw * DM_TILE, map.gh * DM_TILE);
+  ctx.globalCompositeOperation = 'soft-light';
+  ctx.globalAlpha = 0.35;
+  ctx.drawImage(map.overlay, 0, 0, map.gw * DM_TILE, map.gh * DM_TILE);
+  ctx.restore();
+
+  if (reveal < 1) {
+    // glowing scan line
+    const g = ctx.createLinearGradient(0, cut - 40, 0, cut);
+    g.addColorStop(0, 'rgba(76,194,255,0)');
+    g.addColorStop(1, 'rgba(76,194,255,0.55)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, cut - 40, W, 40);
+    ctx.fillStyle = 'rgba(200,240,255,0.95)';
+    ctx.fillRect(0, cut - 2, W, 3);
+  }
+}
+
+/** CSS gradient for the legend, near (left) -> far (right). */
+function depthGradientCss() {
+  const stops = [];
+  for (let i = 0; i <= 10; i++) {
+    const [r, g, b] = depthColor(1 - i / 10);
+    stops.push(`rgb(${r},${g},${b}) ${i * 10}%`);
+  }
+  return `linear-gradient(to right, ${stops.join(', ')})`;
+}
+
 // ---- main.js ----
+
 
 
 
@@ -951,6 +1209,12 @@ const el = {
   frameSlider: $('frameSlider'),
   frameLabel: $('frameLabel'),
   newSweepBtn: $('newSweepBtn'),
+  viewBtn: $('viewBtn'),
+  depthLegend: $('depthLegend'),
+  depthBar: $('depthBar'),
+  legNear: $('legNear'),
+  legMid: $('legMid'),
+  legFar: $('legFar'),
   resultPanel: $('resultPanel'),
   distanceOut: $('distanceOut'),
   resultMeta: $('resultMeta'),
@@ -965,6 +1229,11 @@ let current = 0;
 let point = null; // {x, y} in frame pixels
 let result = null; // {peak, values}
 let busy = false;
+let depthMap = null;
+let viewMode = 'depth'; // 'depth' | 'photo'
+let revealAnim = 0; // rAF id of the depth "scan" reveal
+const debugMode = new URLSearchParams(location.search).has('debug');
+const REVEAL_MS = 1400;
 
 /* ---------- helpers ---------- */
 
@@ -1051,7 +1320,7 @@ async function logEnvironment() {
 
 async function startCamera() {
   setStatus('Starting camera…');
-  showLog();
+  if (debugMode) showLog();
   try {
     // reopen the camera whose focus worked last time (the default back
     // camera can be a fixed-focus lens)
@@ -1090,6 +1359,7 @@ async function startCamera() {
   dlog(`PROBE summary:\n  ${probe.log.join('\n  ')}`);
 
   if (!probe.ok) {
+    showLog();
     setStatus(
       "Focus control doesn't seem to work: the browser accepts focus commands but the picture doesn't change. Details below. You can still try a sweep (aim at a textured scene).",
       'err'
@@ -1119,6 +1389,7 @@ async function runSweep() {
     });
   } catch (e) {
     dlog(`SWEEP failed: ${e.name}: ${e.message}`);
+    showLog();
     setStatus(`Sweep failed: ${e.message}`, 'err');
     return;
   } finally {
@@ -1132,11 +1403,25 @@ async function runSweep() {
 
 /* ---------- review / measure ---------- */
 
-function enterReview() {
+async function enterReview() {
   if (frames.length < 3) {
     setStatus('Too few distinct focus steps captured.', 'err');
     return;
   }
+  setStatus('Building depth map…');
+  // let the status paint before the heavy computation
+  await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+  depthMap = null;
+  try {
+    const t0 = performance.now();
+    depthMap = computeDepthMap(frames);
+    dlog(`DEPTH map ${depthMap.gw}x${depthMap.gh} cells in ${Math.round(performance.now() - t0)} ms, base frame ${depthMap.baseIndex + 1}`);
+  } catch (e) {
+    dlog(`DEPTH map failed: ${e.name}: ${e.message}`);
+  }
+  viewMode = depthMap ? 'depth' : 'photo';
+  updateLegend();
+
   const f = frames[0];
   el.canvas.width = f.width;
   el.canvas.height = f.height;
@@ -1150,17 +1435,59 @@ function enterReview() {
   el.frameSlider.value = String(current);
   point = null;
   result = null;
-  el.hint.textContent = 'Tap the point to measure';
+  el.hint.textContent = 'Tap a spot to measure it';
   el.hint.classList.remove('hidden');
-  setStatus(`Captured ${frames.length} frames. Tap a point with some texture or edges.`, 'ok');
+  setStatus(
+    depthMap
+      ? 'Depth map: warm = near, cool = far. Grey areas have too little texture to judge. Tap a spot for its exact distance.'
+      : `Captured ${frames.length} frames. Tap a point with some texture or edges.`,
+    'ok'
+  );
+  if (viewMode === 'depth') playReveal();
+  else drawFrame();
+}
+
+function updateLegend() {
+  el.depthBar.style.background = depthGradientCss();
+  const near = frames[frames.length - 1].distance;
+  const far = frames[0].distance;
+  el.legNear.textContent = fmtDist(near);
+  el.legMid.textContent = fmtDist(Math.sqrt(near * far));
+  el.legFar.textContent = `${fmtDist(far)}+`;
+}
+
+/** Depth view appears with a top-down "scan" sweep. */
+function playReveal() {
+  cancelAnimationFrame(revealAnim);
+  const start = performance.now();
+  const step = (now) => {
+    const k = Math.min(1, (now - start) / REVEAL_MS);
+    drawFrame(1 - Math.pow(1 - k, 3));
+    if (k < 1 && viewMode === 'depth') revealAnim = requestAnimationFrame(step);
+  };
+  revealAnim = requestAnimationFrame(step);
+}
+
+function setView(mode) {
+  cancelAnimationFrame(revealAnim);
+  viewMode = mode === 'depth' && depthMap ? 'depth' : 'photo';
   drawFrame();
 }
 
-function drawFrame() {
+function drawFrame(reveal = 1) {
   const f = frames[current];
   if (!f) return;
-  ctx.drawImage(f.img, 0, 0, f.width, f.height);
-  el.frameLabel.textContent = `${current + 1}/${frames.length} · focus ${fmtDist(f.distance)}`;
+  const depth = viewMode === 'depth' && depthMap;
+  if (depth) {
+    renderDepth(ctx, frames, depthMap, reveal);
+    el.frameLabel.innerHTML = '<b>🌈 Depth map</b>';
+  } else {
+    ctx.drawImage(f.img, 0, 0, f.width, f.height);
+    el.frameLabel.innerHTML = `Frame <b>${current + 1}/${frames.length} · focus ${fmtDist(f.distance)}</b>`;
+  }
+  el.depthLegend.classList.toggle('hidden', !depth);
+  el.viewBtn.classList.toggle('hidden', !depthMap);
+  el.viewBtn.textContent = depth ? '📷 Photo' : '🌈 Depth';
   if (point) {
     const r = RADIUS;
     const lw = Math.max(2, f.width / 400);
@@ -1225,9 +1552,14 @@ el.canvas.addEventListener('click', onCanvasTap);
 el.copyLogBtn.addEventListener('click', copyLog);
 el.frameSlider.addEventListener('input', () => {
   current = Number(el.frameSlider.value);
-  drawFrame();
+  // scrubbing means "show me the frames"
+  if (viewMode === 'depth') setView('photo');
+  else drawFrame();
 });
+el.viewBtn.addEventListener('click', () => setView(viewMode === 'depth' ? 'photo' : 'depth'));
 el.newSweepBtn.addEventListener('click', () => {
+  cancelAnimationFrame(revealAnim);
+  depthMap = null;
   releaseFrames(frames);
   frames = [];
   result = null;
