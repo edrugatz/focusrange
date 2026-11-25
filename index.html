@@ -206,7 +206,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus · <span id="ver">v11-25 18:09</span></span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 18:36</span></span>
   </header>
 
   <main>
@@ -1113,6 +1113,22 @@ function computeDepthMap(frames) {
     alpha = a2;
   }
 
+  // Colour range = this scene's own depth span (3rd–97th percentile of the
+  // confident cells), not the lens's whole 10 cm–3.6 m range: a scene at
+  // 25–60 cm otherwise came out almost uniformly yellow-green.
+  let vals = [];
+  for (let c = 0; c < cells; c++) if (alpha[c] > 0.4) vals.push(t[c]);
+  if (vals.length < 10) vals = Array.from(t);
+  vals.sort((a, b) => a - b);
+  let tLo = vals[Math.floor(0.03 * (vals.length - 1))];
+  let tHi = vals[Math.floor(0.97 * (vals.length - 1))];
+  const minSpan = 3 / (n - 1); // at least 3 sweep steps
+  if (tHi - tLo < minSpan) {
+    const mid = (tLo + tHi) / 2;
+    tLo = Math.max(0, Math.min(1 - minSpan, mid - minSpan / 2));
+    tHi = tLo + minSpan;
+  }
+
   // small RGBA image of the map; scaled up with smoothing when drawn
   const overlay = document.createElement('canvas');
   overlay.width = gw;
@@ -1120,7 +1136,7 @@ function computeDepthMap(frames) {
   const octx = overlay.getContext('2d');
   const img = octx.createImageData(gw, gh);
   for (let c = 0; c < cells; c++) {
-    const [r, g, b] = depthColor(t[c]);
+    const [r, g, b] = depthColor((t[c] - tLo) / (tHi - tLo));
     img.data[c * 4] = r;
     img.data[c * 4 + 1] = g;
     img.data[c * 4 + 2] = b;
@@ -1128,19 +1144,30 @@ function computeDepthMap(frames) {
   }
   octx.putImageData(img, 0, 0);
 
-  return { gw, gh, t, alpha, baseIndex, overlay };
+  return { gw, gh, t, alpha, baseIndex, overlay, tLo, tHi };
+}
+
+/** Fractional sweep position t (0 = far frame, 1 = near frame) -> meters. */
+function depthToMeters(frames, t) {
+  const n = frames.length;
+  const f = Math.min(1, Math.max(0, t)) * (n - 1);
+  const k0 = Math.min(n - 2, Math.floor(f));
+  const dio = frames[k0].diopter + (f - k0) * (frames[k0 + 1].diopter - frames[k0].diopter);
+  return dio > 0 ? 1 / dio : Infinity;
 }
 
 /**
- * Draws the photo in grey with the depth colours blended in ("color" blend
- * keeps the photo's detail). reveal 0..1 animates a top-down scan.
+ * Paints the depth colours over a dimmed grey photo, then brings the photo's
+ * detail back with an "overlay" pass. (A "color" blend kept the photo's own
+ * brightness, so white/black areas showed no depth colour and the tint read
+ * as the object's real colour.) reveal 0..1 animates a top-down scan.
  */
 function renderDepth(ctx, frames, map, reveal = 1) {
   const f = frames[map.baseIndex];
   const W = f.width;
   const H = f.height;
   ctx.save();
-  ctx.filter = 'grayscale(1) brightness(1.08) contrast(1.05)';
+  ctx.filter = 'grayscale(1) brightness(0.6) contrast(1.1)';
   ctx.drawImage(f.img, 0, 0, W, H);
   ctx.filter = 'none';
 
@@ -1150,11 +1177,12 @@ function renderDepth(ctx, frames, map, reveal = 1) {
   ctx.clip();
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.globalCompositeOperation = 'color';
+  ctx.globalAlpha = 0.85;
   ctx.drawImage(map.overlay, 0, 0, map.gw * DM_TILE, map.gh * DM_TILE);
-  ctx.globalCompositeOperation = 'soft-light';
-  ctx.globalAlpha = 0.35;
-  ctx.drawImage(map.overlay, 0, 0, map.gw * DM_TILE, map.gh * DM_TILE);
+  ctx.globalAlpha = 0.45;
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.filter = 'grayscale(1)';
+  ctx.drawImage(f.img, 0, 0, W, H);
   ctx.restore();
 
   if (reveal < 1) {
@@ -1439,7 +1467,7 @@ async function enterReview() {
   el.hint.classList.remove('hidden');
   setStatus(
     depthMap
-      ? 'Depth map: warm = near, cool = far. Grey areas have too little texture to judge. Tap a spot for its exact distance.'
+      ? 'Depth map: red = nearest, blue = farthest in this scene. Grey = plain surface with no detail to judge focus by. Tap a spot for its exact distance.'
       : `Captured ${frames.length} frames. Tap a point with some texture or edges.`,
     'ok'
   );
@@ -1447,13 +1475,14 @@ async function enterReview() {
   else drawFrame();
 }
 
+/** Legend shows this scene's own depth span (the colour scale is auto-ranged). */
 function updateLegend() {
+  if (!depthMap) return;
+  const { tLo, tHi } = depthMap;
   el.depthBar.style.background = depthGradientCss();
-  const near = frames[frames.length - 1].distance;
-  const far = frames[0].distance;
-  el.legNear.textContent = fmtDist(near);
-  el.legMid.textContent = fmtDist(Math.sqrt(near * far));
-  el.legFar.textContent = `${fmtDist(far)}+`;
+  el.legNear.textContent = fmtDist(depthToMeters(frames, tHi));
+  el.legMid.textContent = fmtDist(depthToMeters(frames, (tLo + tHi) / 2));
+  el.legFar.textContent = fmtDist(depthToMeters(frames, tLo)) + (tLo <= 0.01 ? '+' : '');
 }
 
 /** Depth view appears with a top-down "scan" sweep. */
