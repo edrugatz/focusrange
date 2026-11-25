@@ -294,8 +294,30 @@ function findPeak(xs, ys) {
     if (best >= 0 && s[best] >= 0.85 * s[i]) i = best;
   }
 
+  // Region of best focus: the contiguous run around the maximum that is
+  // within 20% of the curve's height range from the top. Far away (and at a
+  // lens that bottoms out) several frames are equally sharp; that whole run
+  // is the answer, not whichever end of it is noisiest.
+  let lo = Infinity;
+  for (const v of s) lo = Math.min(lo, v);
+  const thr = lo + 0.8 * (s[i] - lo);
+  let a = i;
+  let b = i;
+  while (a > 0 && s[a - 1] >= thr) a--;
+  while (b < n - 1 && s[b + 1] >= thr) b++;
+
   let peak = xs[i];
-  if (i > 0 && i < n - 1) {
+  if (b - a >= 3) {
+    // plateau: weighted centroid in diopters
+    let w = 0;
+    let wx = 0;
+    for (let k = a; k <= b; k++) {
+      const wk = s[k] - thr + 1e-12;
+      w += wk;
+      wx += wk * xs[k];
+    }
+    peak = wx / w;
+  } else if (i > 0 && i < n - 1) {
     // Gaussian fit = parabola through log values (non-uniform spacing)
     const [x0, x1, x2] = [xs[i - 1], xs[i], xs[i + 1]];
     const [y0, y1, y2] = [s[i - 1], s[i], s[i + 1]].map((v) => Math.log(v + 1e-12));
@@ -311,15 +333,22 @@ function findPeak(xs, ys) {
   const median = sorted[Math.floor(n / 2)] || 1e-12;
   const ratio = s[i] / median;
 
-  const spacing =
-    i > 0 && i < n - 1 ? (xs[i + 1] - xs[i - 1]) / 2 : Math.abs(xs[Math.min(i + 1, n - 1)] - xs[Math.max(i - 1, 0)]);
+  // uncertainty: the best-focus region widened by half a step on each side
+  const half = (k) => Math.abs(xs[Math.min(k + 1, n - 1)] - xs[Math.max(k - 1, 0)]) / 4;
+  const dMin = Math.max(0, xs[a] - half(a));
+  const dMax = xs[b] + half(b);
+
+  // frame shown = the one closest to the estimate
+  let index = a;
+  for (let k = a; k <= b; k++) if (Math.abs(xs[k] - peak) < Math.abs(xs[index] - peak)) index = k;
 
   return {
-    index: i,
+    index,
     diopter: peak,
+    dMin, // far bound (diopters)
+    dMax, // near bound (diopters)
     ratio,
-    halfStep: spacing / 2,
-    edge: i === 0 ? 'far' : i === n - 1 ? 'near' : null,
+    edge: a === 0 ? 'far' : b === n - 1 ? 'near' : null,
     smoothed: s,
   };
 }
@@ -439,7 +468,8 @@ function drawChart(canvas, xs, ys, { peakX = null, currentX = null } = {}) {
   const maxY = Math.max(...ys) || 1;
   const minY = Math.min(...ys);
   // log scale: otherwise the few cm closest to the lens take up most of the width
-  const lg = (x) => Math.log(Math.max(x, 1e-3));
+  // (the ~infinity frame is drawn at the 20 m position)
+  const lg = (x) => Math.log(Math.max(x, 0.05));
   const lMin = lg(minX);
   const lMax = lg(maxX);
   const px = (x) => pad.l + ((lg(x) - lMin) / (lMax - lMin || 1)) * (W - pad.l - pad.r);
@@ -526,17 +556,25 @@ function releaseFrames(frames) {
   frames.forEach((f) => URL.revokeObjectURL(f.img.src));
 }
 
-/** Focus distances (m) for the sweep, uniform in diopters, near -> far, deduplicated. */
+const FAR_LIMIT = 10; // m; beyond this phone lenses can't tell distances apart
+
+/**
+ * Focus distances (m) for the sweep, near -> far, deduplicated.
+ * Log-spaced (equal ratio between steps) from the closest focus to 10 m, plus
+ * one frame at the far end (~infinity). Uniform-in-diopter spacing put 28 of
+ * 30 steps under 30 cm and left nothing between 58 cm and infinity.
+ */
 function plan({ min, max, step }, steps) {
-  const dNear = 1 / Math.max(min, 0.02);
-  const dFar = 1 / Math.min(max, 1000);
+  const near = Math.max(min, 0.02);
+  const far = Math.min(max, FAR_LIMIT);
   const out = [];
-  for (let i = 0; i < steps; i++) {
-    const D = dNear + ((dFar - dNear) * i) / (steps - 1);
-    let dist = Math.min(max, Math.max(min, 1 / D));
+  const add = (d) => {
+    let dist = Math.min(max, Math.max(min, d));
     if (step > 0) dist = Math.min(max, min + Math.round((dist - min) / step) * step);
-    if (!out.some((d) => Math.abs(d - dist) < 1e-4)) out.push(dist);
-  }
+    if (!out.some((x) => Math.abs(x - dist) / dist < 1e-3)) out.push(dist);
+  };
+  for (let i = 0; i < steps; i++) add(near * Math.pow(far / near, i / (steps - 1)));
+  if (max > far) add(Math.min(max, 1000));
   return out;
 }
 
@@ -763,14 +801,14 @@ function measure() {
 
 function renderResult() {
   const { peak } = result;
-  el.distanceOut.textContent = fmtDist(peak.diopter > 0 ? 1 / peak.diopter : Infinity);
+  el.distanceOut.textContent =
+    peak.edge === 'far' ? `≥ ${fmtDist(1 / peak.dMax)}` : fmtDist(peak.diopter > 0 ? 1 / peak.diopter : Infinity);
 
-  const lo = peak.diopter + peak.halfStep;
-  const hi = peak.diopter - peak.halfStep;
   const quality = peak.ratio > 3 ? 'good' : peak.ratio > 1.6 ? 'fair' : 'low';
-  let html = `Range ≈ ${fmtDist(1 / lo)} – ${fmtDist(hi > 0 ? 1 / hi : Infinity)} · confidence <b>${quality}</b>`;
-  if (peak.edge === 'near') html += `<br><span class="warn">⚠ Sharpest at the nearest step: the point may be closer than the lens can focus.</span>`;
-  if (peak.edge === 'far') html += `<br><span class="warn">⚠ Sharpest at the farthest step: the point is at or beyond the far limit.</span>`;
+  const far = peak.dMin > 0 ? 1 / peak.dMin : Infinity;
+  let html = `Range ≈ ${fmtDist(1 / peak.dMax)} – ${fmtDist(far)} · confidence <b>${quality}</b>`;
+  if (peak.edge === 'near') html += `<br><span class="warn">⚠ Sharpest at the nearest steps: the point may be closer than the lens can focus.</span>`;
+  if (peak.edge === 'far') html += `<br><span class="warn">⚠ Sharp all the way to the far end: the point is at least ${fmtDist(1 / peak.dMax)} away (beyond that, focus can't tell distances apart).</span>`;
   if (quality === 'low') html += `<br><span class="warn">⚠ Weak focus peak: try a spot with more texture or edges.</span>`;
   el.resultMeta.innerHTML = html;
 }
