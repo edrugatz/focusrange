@@ -107,6 +107,19 @@ main {
 .status.warn { color: var(--warn); }
 .status.err { color: var(--err); }
 
+.diag {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .controls {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -180,7 +193,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus · <span id="ver">v11-25 15:52</span></span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 15:58</span></span>
   </header>
 
   <main>
@@ -192,6 +205,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 
     <div class="progress hidden" id="progress"><div id="progressBar"></div></div>
     <div id="status" class="status">Hold the phone steady (resting it on something helps).</div>
+    <pre id="diag" class="diag hidden"></pre>
 
     <button id="mainBtn" class="primary">📷 Start camera</button>
 
@@ -355,36 +369,51 @@ function findPeak(xs, ys) {
 
 // ---- camera.js ----
 // Wraps getUserMedia + the Image Capture focus constraints.
+
+const BASE = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+
+// Different ways to ask for a manual focus distance. Browsers/phones differ in
+// which one they honour; "advanced" sets are *silently ignored* when any part
+// can't be satisfied, so probe.js checks which one really moves the lens.
+const METHODS = {
+  advanced: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual', focusDistance: d }] }),
+  separate: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual' }, { focusDistance: d }] }),
+  basic: (t, d) => t.applyConstraints({ ...BASE, focusMode: 'manual', focusDistance: d }),
+};
+const FOCUS_METHODS = Object.keys(METHODS);
+
 class Camera {
   constructor(video) {
     this.video = video;
     this.stream = null;
     this.track = null;
     this.caps = {};
+    this.label = '';
+    this.deviceId = null;
+    this.method = 'advanced';
   }
 
   get active() {
     return !!this.stream;
   }
 
-  async start() {
+  async start(deviceId = null) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('Camera API unavailable (needs HTTPS or localhost).');
     }
+    this.stop();
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-      },
+      video: deviceId ? { ...BASE, deviceId: { exact: deviceId } } : { ...BASE, facingMode: { ideal: 'environment' } },
     });
     this.video.srcObject = this.stream;
     await this.video.play();
     this.track = this.stream.getVideoTracks()[0];
     // Some browsers only fill in capabilities once frames are flowing.
-    await this.waitFrames(2);
+    await this.waitFrames(3);
     this.caps = this.track.getCapabilities ? this.track.getCapabilities() : {};
+    this.label = this.track.label || 'camera';
+    this.deviceId = this.track.getSettings().deviceId || deviceId;
   }
 
   stop() {
@@ -393,6 +422,12 @@ class Camera {
     this.track = null;
     this.caps = {};
     this.video.srcObject = null;
+  }
+
+  /** All back-facing cameras (labels are available once permission is granted). */
+  static async backCameras() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((d) => d.kind === 'videoinput' && !/front|user|selfie/i.test(d.label));
   }
 
   /** Returns {min, max, step} in meters, or null when manual focus isn't exposed. */
@@ -405,9 +440,7 @@ class Camera {
   }
 
   async setFocus(distance) {
-    await this.track.applyConstraints({
-      advanced: [{ focusMode: 'manual', focusDistance: distance }],
-    });
+    await METHODS[this.method](this.track, distance);
   }
 
   currentFocus() {
@@ -415,12 +448,19 @@ class Camera {
     return s.focusDistance;
   }
 
+  /** e.g. "manual @ 0.25" — what the browser says the camera is doing. */
+  focusReport() {
+    const s = this.track?.getSettings ? this.track.getSettings() : {};
+    const d = Number.isFinite(s.focusDistance) ? s.focusDistance.toFixed(3) : s.focusDistance;
+    return `${s.focusMode ?? '?'} @ ${d ?? '?'}`;
+  }
+
   async restoreAutoFocus() {
     const modes = this.caps.focusMode || [];
     const mode = modes.includes('continuous') ? 'continuous' : modes.includes('single-shot') ? 'single-shot' : null;
     if (!mode || !this.track) return;
     try {
-      await this.track.applyConstraints({ advanced: [{ focusMode: mode }] });
+      await this.track.applyConstraints({ ...BASE, advanced: [{ focusMode: mode }] });
     } catch {
       /* not critical */
     }
@@ -622,7 +662,106 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, on
   return frames.sort((a, b) => a.diopter - b.diopter);
 }
 
+// ---- probe.js ----
+// Checks that focus commands really move the lens: whole-frame sharpness is
+// measured at near and far focus. If it barely changes, the command is being
+// ignored, so other command styles and other back cameras are tried.
+
+
+const MIN_RATIO = 1.3; // near/far sharpness change that proves the lens moves
+
+const probeCanvas = document.createElement('canvas');
+const probeCtx = probeCanvas.getContext('2d', { willReadFrequently: true });
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function frameSharpness(video) {
+  const w = 320;
+  const h = Math.round((w * video.videoHeight) / video.videoWidth) || 240;
+  probeCanvas.width = w;
+  probeCanvas.height = h;
+  probeCtx.drawImage(video, 0, 0, w, h);
+  const gray = toGray(probeCtx.getImageData(0, 0, w, h));
+  return sharpness(gray, w, h, w >> 1, h >> 1, Math.max(w, h));
+}
+
+async function sharpnessAt(camera, dist) {
+  await camera.setFocus(dist);
+  await wait(900);
+  await camera.waitFrames(3);
+  let s = 0;
+  for (let k = 0; k < 3; k++) {
+    s += frameSharpness(camera.video);
+    await camera.waitFrames(1);
+  }
+  return s / 3;
+}
+
+/** Tries each focus command style on the open camera. */
+async function testCamera(camera, log) {
+  const r = camera.focusRange;
+  const name = camera.label || 'camera';
+  if (!r) {
+    const modes = (camera.caps.focusMode || []).join('/') || 'none';
+    log.push(`${name}: no manual focus (modes: ${modes})`);
+    return false;
+  }
+  const near = r.min;
+  const far = Math.min(r.max, 10);
+  for (const method of FOCUS_METHODS) {
+    camera.method = method;
+    try {
+      const a = await sharpnessAt(camera, near);
+      const reportNear = camera.focusReport();
+      const b = await sharpnessAt(camera, far);
+      const ratio = Math.max(a, b) / Math.max(1e-9, Math.min(a, b));
+      log.push(`${name} [${method}]: change ×${ratio.toFixed(2)} (reports ${reportNear} → ${camera.focusReport()})`);
+      if (ratio >= MIN_RATIO) return true;
+    } catch (e) {
+      log.push(`${name} [${method}]: ${e.name || 'error'} ${e.message || ''}`.trim());
+    }
+  }
+  return false;
+}
+
+/**
+ * Finds a camera + command style where focus visibly changes.
+ * Returns {ok, log}. On failure the originally opened camera is reopened.
+ */
+async function findWorkingFocus(camera, onStatus) {
+  const log = [];
+  onStatus?.('Testing focus control…');
+  if (await testCamera(camera, log)) return { ok: true, log };
+
+  const firstId = camera.deviceId;
+  const firstMethod = 'advanced';
+  let cams = [];
+  try {
+    cams = (await Camera.backCameras()).filter((c) => c.deviceId && c.deviceId !== firstId);
+  } catch {
+    /* enumerate not available */
+  }
+  for (let i = 0; i < cams.length; i++) {
+    onStatus?.(`Focus didn't move. Trying camera ${i + 2}/${cams.length + 1}…`);
+    try {
+      await camera.start(cams[i].deviceId);
+    } catch (e) {
+      log.push(`${cams[i].label || 'camera'}: could not open (${e.name})`);
+      continue;
+    }
+    if (await testCamera(camera, log)) return { ok: true, log };
+  }
+
+  try {
+    await camera.start(firstId);
+  } catch {
+    await camera.start();
+  }
+  camera.method = firstMethod;
+  return { ok: false, log };
+}
+
 // ---- main.js ----
+
 
 
 
@@ -640,6 +779,7 @@ const el = {
   canvas: $('frameCanvas'),
   hint: $('hint'),
   status: $('status'),
+  diag: $('diag'),
   progress: $('progress'),
   progressBar: $('progressBar'),
   mainBtn: $('mainBtn'),
@@ -711,14 +851,32 @@ async function startCamera() {
     return;
   }
   el.hint.classList.add('hidden');
-  const r = camera.focusRange;
-  if (!r) {
-    setStatus('This camera/browser does not allow manual focus control, so a focus sweep is not possible.', 'err');
-    el.mainBtn.disabled = true;
-    return;
+
+  // Make sure focus commands actually move the lens before offering a sweep.
+  busy = true;
+  el.mainBtn.disabled = true;
+  let probe;
+  try {
+    probe = await findWorkingFocus(camera, (msg) => setStatus(`${msg} Point at something with detail.`));
+  } catch (e) {
+    probe = { ok: false, log: [`test failed: ${e.message}`] };
+  }
+  await camera.restoreAutoFocus();
+  busy = false;
+  el.mainBtn.disabled = false;
+  el.diag.textContent = probe.log.join('\n');
+  el.diag.classList.remove('hidden');
+
+  if (!probe.ok) {
+    setStatus(
+      "Focus control doesn't seem to work: the browser accepts focus commands but the picture doesn't change. Details below. You can still try a sweep (aim at a textured scene).",
+      'err'
+    );
+  } else {
+    const r = camera.focusRange;
+    setStatus(`Focus control works (${fmtDist(r.min)} – ${fmtDist(r.max)}). Aim, hold steady, then capture.`, 'ok');
   }
   el.mainBtn.textContent = '🎯 Capture focus sweep';
-  setStatus(`Manual focus ${fmtDist(r.min)} – ${fmtDist(r.max)}. Aim, hold steady, then capture.`, 'ok');
 }
 
 async function runSweep() {
