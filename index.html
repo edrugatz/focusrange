@@ -206,7 +206,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 <body>
   <header>
     <h1>📏 FocusRange</h1>
-    <span class="tag">depth from focus · <span id="ver">v11-25 18:36</span></span>
+    <span class="tag">depth from focus · <span id="ver">v11-25 19:06</span></span>
   </header>
 
   <main>
@@ -447,16 +447,21 @@ const camPause = (ms) => new Promise((r) => setTimeout(r, ms));
 // make Chrome reconfigure the camera, which can restart autofocus.
 // (Plain top-level focus constraints are always rejected by Chrome: "Mixing
 // ImageCapture and non-ImageCapture constraints is not currently supported".)
+// `x` = extra advanced sets (exposure/white-balance lock during a sweep). They
+// are separate sets so that, if one is unsatisfiable, only it is skipped and
+// the focus set still applies.
 const METHODS = {
-  bare: (t, d) => t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }] }),
-  advanced: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual', focusDistance: d }] }),
-  separate: (t, d) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual' }, { focusDistance: d }] }),
-  twoStep: async (t, d) => {
+  bare: (t, d, x) => t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }, ...x] }),
+  advanced: (t, d, x) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual', focusDistance: d }, ...x] }),
+  separate: (t, d, x) => t.applyConstraints({ ...BASE, advanced: [{ focusMode: 'manual' }, { focusDistance: d }, ...x] }),
+  twoStep: async (t, d, x) => {
     await t.applyConstraints({ advanced: [{ focusMode: 'manual' }] });
     await camPause(150);
-    await t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }] });
+    await t.applyConstraints({ advanced: [{ focusMode: 'manual', focusDistance: d }, ...x] });
   },
 };
+
+const clampTo = (v, r) => (r && Number.isFinite(r.min) && Number.isFinite(r.max) ? Math.min(r.max, Math.max(r.min, v)) : v);
 const FOCUS_METHODS = Object.keys(METHODS);
 
 class Camera {
@@ -468,6 +473,7 @@ class Camera {
     this.label = '';
     this.deviceId = null;
     this.method = 'bare';
+    this.extraSets = []; // exposure/white-balance lock sent with every focus command
   }
 
   get active() {
@@ -535,7 +541,7 @@ class Camera {
   async setFocus(distance) {
     const t0 = performance.now();
     try {
-      await METHODS[this.method](this.track, distance);
+      await METHODS[this.method](this.track, distance, this.extraSets);
     } catch (e) {
       dlog(`  setFocus[${this.method}](${distance}) REJECTED ${e.name}: ${e.message} ${e.constraint ? 'constraint=' + e.constraint : ''}`);
       throw e;
@@ -555,13 +561,50 @@ class Camera {
     return `${s.focusMode ?? '?'} @ ${d ?? '?'}`;
   }
 
+  /** Exposure, ISO and white balance as the camera reports them right now. */
+  exposureReport() {
+    const s = this.track?.getSettings ? this.track.getSettings() : {};
+    return dbgJson({
+      exposureMode: s.exposureMode,
+      exposureTime: s.exposureTime,
+      iso: s.iso,
+      whiteBalanceMode: s.whiteBalanceMode,
+      colorTemperature: s.colorTemperature,
+    });
+  }
+
+  /**
+   * Freezes exposure and white balance at their current auto values for the
+   * sweep, so brightness/noise processing can't change between frames and
+   * pass for a focus change. Takes effect with the next setFocus().
+   */
+  lockExposure() {
+    const s = this.track?.getSettings ? this.track.getSettings() : {};
+    const caps = this.caps;
+    const sets = [];
+    if ((caps.exposureMode || []).includes('manual') && Number.isFinite(s.exposureTime)) {
+      const e = { exposureMode: 'manual', exposureTime: clampTo(s.exposureTime, caps.exposureTime) };
+      if (caps.iso && Number.isFinite(s.iso)) e.iso = clampTo(s.iso, caps.iso);
+      sets.push(e);
+    }
+    if ((caps.whiteBalanceMode || []).includes('manual') && Number.isFinite(s.colorTemperature)) {
+      sets.push({ whiteBalanceMode: 'manual', colorTemperature: clampTo(s.colorTemperature, caps.colorTemperature) });
+    }
+    this.extraSets = sets;
+    dlog(`EXPOSURE lock: was ${this.exposureReport()} → sending`, sets.length ? sets : 'nothing (values not reported)');
+  }
+
   async restoreAutoFocus() {
+    this.extraSets = [];
     const modes = this.caps.focusMode || [];
     const mode = modes.includes('continuous') ? 'continuous' : modes.includes('single-shot') ? 'single-shot' : null;
     if (!mode || !this.track) return;
+    const sets = [{ focusMode: mode }];
+    if ((this.caps.exposureMode || []).includes('continuous')) sets.push({ exposureMode: 'continuous' });
+    if ((this.caps.whiteBalanceMode || []).includes('continuous')) sets.push({ whiteBalanceMode: 'continuous' });
     try {
-      await this.track.applyConstraints({ ...BASE, advanced: [{ focusMode: mode }] });
-      dlog(`  restore AF (${mode}) → ${focusState(this.track)}`);
+      await this.track.applyConstraints({ ...BASE, advanced: sets });
+      dlog(`  restore AF (${mode}) → ${focusState(this.track)} ${this.exposureReport()}`);
     } catch (e) {
       dlog(`  restore AF failed: ${e.name} ${e.message}`);
     }
@@ -742,9 +785,13 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, on
   // Pre-position the lens and let it fully arrive before the first grab.
   // Autofocus has usually just focused on the subject, so a frame grabbed
   // before the lens has really moved looks sharp at the first (nearest) step.
+  // Exposure/white balance are frozen at the same moment (sent with each
+  // focus command) so brightness can't drift during the sweep.
+  camera.lockExposure();
   await camera.setFocus(dists[0]);
   await sleep(Math.max(1000, settleMs * 4));
   await camera.waitFrames(3);
+  dlog(`  exposure now ${camera.exposureReport()}`);
 
   const whole = [];
   for (let i = 0; i < dists.length; i++) {
@@ -763,7 +810,10 @@ async function captureSweep(camera, { steps, settleMs, maxWidth, samples = 1, on
     frames.push(f);
     const s = sharpness(f.gray, f.width, f.height, f.width >> 1, f.height >> 1, Math.max(f.width, f.height));
     whole.push(s);
-    dlog(`  step ${i + 1}: asked ${dist.toFixed(3)} m, reported ${reported ?? '?'}, whole-frame sharpness ${s.toFixed(2)}`);
+    let lum = 0;
+    for (let k = 0; k < f.gray.length; k += 16) lum += f.gray[k];
+    lum /= Math.ceil(f.gray.length / 16);
+    dlog(`  step ${i + 1}: asked ${dist.toFixed(3)} m, reported ${reported ?? '?'}, whole-frame sharpness ${s.toFixed(2)}, brightness ${lum.toFixed(1)}`);
   }
   const hi = Math.max(...whole);
   const lo = Math.min(...whole);
@@ -940,14 +990,482 @@ function probeDone(camera, best, log) {
   return { ok: true, log };
 }
 
+// ---- align.js ----
+// Aligns the focus stack. Refocusing zooms phone lenses slightly ("focus
+// breathing") and the hand moves, so an edge drifts across neighbouring depth
+// cells during the sweep and the cells see sharpness peaks from the wrong
+// frames. Model per frame: scale about the image centre + shift,
+//   p_k = c + s_k (p_ref - c) + t_k   (p_ref = point in the reference frame).
+// Neighbouring frames are matched (similar blur, so they compare well) with a
+// coarse-to-fine Lucas–Kanade fit on blurred low-res copies; the steps are
+// chained and re-referenced to the middle frame, then every frame's gray image
+// is resampled onto the reference grid.
+
+const AL_LEVELS = [16, 8, 4]; // downsample factors, coarse -> fine
+const AL_ITERS = 15;
+const AL_MAX_SCALE_STEP = 0.05; // per-neighbour sanity limits
+const AL_MAX_SHIFT_FRAC = 0.06;
+
+/** Box-downsample by integer factor f. */
+function alDown(src, w, h, f) {
+  const ow = Math.floor(w / f);
+  const oh = Math.floor(h / f);
+  const out = new Float32Array(ow * oh);
+  const inv = 1 / (f * f);
+  for (let y = 0; y < oh; y++) {
+    for (let x = 0; x < ow; x++) {
+      let s = 0;
+      for (let yy = 0; yy < f; yy++) {
+        let i = (y * f + yy) * w + x * f;
+        for (let xx = 0; xx < f; xx++) s += src[i++];
+      }
+      out[y * ow + x] = s * inv;
+    }
+  }
+  return { data: out, w: ow, h: oh };
+}
+
+/** Zero-mean / unit-variance + central-difference gradients. */
+function alPrepare(level) {
+  const { data, w, h } = level;
+  let mean = 0;
+  for (let i = 0; i < data.length; i++) mean += data[i];
+  mean /= data.length;
+  let v = 0;
+  for (let i = 0; i < data.length; i++) v += (data[i] - mean) ** 2;
+  const sd = Math.sqrt(v / data.length) || 1;
+  for (let i = 0; i < data.length; i++) data[i] = (data[i] - mean) / sd;
+  const gx = new Float32Array(w * h);
+  const gy = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      gx[i] = (data[i + 1] - data[i - 1]) / 2;
+      gy[i] = (data[i + w] - data[i - w]) / 2;
+    }
+  }
+  level.gx = gx;
+  level.gy = gy;
+  return level;
+}
+
+/** Pyramid keyed by factor: {16: level, 8: level, 4: level}. */
+function alPyramid(gray, w, h) {
+  // build every level from raw data first; alPrepare normalises in place
+  const raw4 = alDown(gray, w, h, 4);
+  const raw8 = alDown(raw4.data, raw4.w, raw4.h, 2);
+  const raw16 = alDown(raw8.data, raw8.w, raw8.h, 2);
+  return { 4: alPrepare(raw4), 8: alPrepare(raw8), 16: alPrepare(raw16) };
+}
+
+/** Solves the 3x3 system H x = b (Gaussian elimination); null if singular. */
+function alSolve3(H, b) {
+  const m = [
+    [H[0], H[1], H[2], b[0]],
+    [H[3], H[4], H[5], b[1]],
+    [H[6], H[7], H[8], b[2]],
+  ];
+  for (let c = 0; c < 3; c++) {
+    let p = c;
+    for (let r = c + 1; r < 3; r++) if (Math.abs(m[r][c]) > Math.abs(m[p][c])) p = r;
+    if (Math.abs(m[p][c]) < 1e-12) return null;
+    [m[c], m[p]] = [m[p], m[c]];
+    for (let r = 0; r < 3; r++) {
+      if (r === c) continue;
+      const k = m[r][c] / m[c][c];
+      for (let j = c; j < 4; j++) m[r][j] -= k * m[c][j];
+    }
+  }
+  return [m[0][3] / m[0][0], m[1][3] / m[1][1], m[2][3] / m[2][2]];
+}
+
+/**
+ * Gauss-Newton fit of I(c + a (p - c) + b) ≈ T(p) on one level.
+ * q = [a, bx, by] in this level's pixels; updated in place.
+ */
+function alFitLevel(T, I, q) {
+  const { w, h } = T;
+  const cx = (w - 1) / 2;
+  const cy = (h - 1) / 2;
+  const H = new Float64Array(9);
+  const g = new Float64Array(3);
+  const m = 2;
+  for (let it = 0; it < AL_ITERS; it++) {
+    H.fill(0);
+    g.fill(0);
+    const [a, bx, by] = q;
+    for (let y = m; y < h - m; y++) {
+      const dy = y - cy;
+      const v = cy + a * dy + by;
+      if (v < 0 || v > h - 2) continue;
+      const y0 = Math.floor(v);
+      const fy = v - y0;
+      for (let x = m; x < w - m; x++) {
+        const dx = x - cx;
+        const u = cx + a * dx + bx;
+        if (u < 0 || u > w - 2) continue;
+        const x0 = Math.floor(u);
+        const fx = u - x0;
+        const i = y0 * w + x0;
+        const w00 = (1 - fx) * (1 - fy);
+        const w10 = fx * (1 - fy);
+        const w01 = (1 - fx) * fy;
+        const w11 = fx * fy;
+        const iv = I.data[i] * w00 + I.data[i + 1] * w10 + I.data[i + w] * w01 + I.data[i + w + 1] * w11;
+        const gxv = I.gx[i] * w00 + I.gx[i + 1] * w10 + I.gx[i + w] * w01 + I.gx[i + w + 1] * w11;
+        const gyv = I.gy[i] * w00 + I.gy[i + 1] * w10 + I.gy[i + w] * w01 + I.gy[i + w + 1] * w11;
+        const r = iv - T.data[y * w + x];
+        const j0 = gxv * dx + gyv * dy;
+        H[0] += j0 * j0;
+        H[1] += j0 * gxv;
+        H[2] += j0 * gyv;
+        H[4] += gxv * gxv;
+        H[5] += gxv * gyv;
+        H[8] += gyv * gyv;
+        g[0] += j0 * r;
+        g[1] += gxv * r;
+        g[2] += gyv * r;
+      }
+    }
+    H[3] = H[1];
+    H[6] = H[2];
+    H[7] = H[5];
+    const d = alSolve3(H, [-g[0], -g[1], -g[2]]);
+    if (!d) break;
+    q[0] += d[0];
+    q[1] += d[1];
+    q[2] += d[2];
+    if (Math.abs(d[0]) < 1e-5 && Math.abs(d[1]) < 1e-3 && Math.abs(d[2]) < 1e-3) break;
+  }
+}
+
+/** Scale/shift taking frame-A points to frame-B points (full-res pixels). */
+function alEstimatePair(pa, pb, w) {
+  const q = [1, 0, 0];
+  let prevF = AL_LEVELS[0];
+  for (const f of AL_LEVELS) {
+    q[1] *= prevF / f;
+    q[2] *= prevF / f;
+    prevF = f;
+    alFitLevel(pa[f], pb[f], q);
+  }
+  const res = { a: q[0], bx: q[1] * prevF, by: q[2] * prevF };
+  const ok =
+    Number.isFinite(res.a) &&
+    Math.abs(res.a - 1) < AL_MAX_SCALE_STEP &&
+    Math.hypot(res.bx, res.by) < AL_MAX_SHIFT_FRAC * w;
+  return ok ? res : null;
+}
+
+/** Resamples gray so that output pixel p_ref = input at c + s (p_ref - c) + t. */
+function alWarpGray(gray, w, h, s, tx, ty) {
+  const out = new Uint8ClampedArray(w * h);
+  const cx = (w - 1) / 2;
+  const cy = (h - 1) / 2;
+  for (let y = 0; y < h; y++) {
+    let v = cy + s * (y - cy) + ty;
+    v = Math.min(h - 1.001, Math.max(0, v));
+    const y0 = Math.floor(v);
+    const fy = v - y0;
+    const row0 = y0 * w;
+    const row1 = Math.min(h - 1, y0 + 1) * w;
+    for (let x = 0; x < w; x++) {
+      let u = cx + s * (x - cx) + tx;
+      u = Math.min(w - 1.001, Math.max(0, u));
+      const x0 = Math.floor(u);
+      const fx = u - x0;
+      const a = gray[row0 + x0] + (gray[row0 + x0 + 1] - gray[row0 + x0]) * fx;
+      const b = gray[row1 + x0] + (gray[row1 + x0 + 1] - gray[row1 + x0]) * fx;
+      out[y * w + x] = a + (b - a) * fy;
+    }
+  }
+  return out;
+}
+
+/**
+ * Aligns all frames to the middle one in place: sets f.align = {s, tx, ty}
+ * and replaces f.gray with the aligned image. Returns a short summary.
+ */
+function alignFrames(frames) {
+  const n = frames.length;
+  const { width: w, height: h } = frames[0];
+  // chain neighbour steps: transform of frame k relative to frame 0
+  const chain = [{ s: 1, tx: 0, ty: 0 }];
+  let prev = alPyramid(frames[0].gray, w, h);
+  let failed = 0;
+  for (let k = 1; k < n; k++) {
+    const cur = alPyramid(frames[k].gray, w, h);
+    let step = alEstimatePair(prev, cur, w);
+    if (!step) {
+      failed++;
+      dlog(`  align ${k}->${k + 1}: fit failed, assuming no motion`);
+      step = { a: 1, bx: 0, by: 0 };
+    }
+    const p = chain[k - 1];
+    chain.push({ s: step.a * p.s, tx: step.a * p.tx + step.bx, ty: step.a * p.ty + step.by });
+    prev = cur;
+  }
+
+  // re-reference to the middle frame: p_k = c + (s_k/s_r)(p_r - c - t_r) + t_k
+  const r = Math.floor((n - 1) / 2);
+  const ref = chain[r];
+  let maxScale = 0;
+  let maxShift = 0;
+  frames.forEach((f, k) => {
+    const s = chain[k].s / ref.s;
+    const tx = chain[k].tx - s * ref.tx;
+    const ty = chain[k].ty - s * ref.ty;
+    f.align = { s, tx, ty };
+    maxScale = Math.max(maxScale, Math.abs(s - 1));
+    maxShift = Math.max(maxShift, Math.hypot(tx, ty));
+    if (k !== r) f.gray = alWarpGray(f.gray, w, h, s, tx, ty);
+  });
+  const summary = `zoom up to ${(maxScale * 100).toFixed(2)}%, shift up to ${maxShift.toFixed(1)} px, ${failed} failed`;
+  dlog(`ALIGN ${n} frames to frame ${r + 1}: ${summary}`);
+  dlog(
+    '  per frame (scale%, dx, dy): ' +
+      frames.map((f) => `${((f.align.s - 1) * 100).toFixed(2)},${f.align.tx.toFixed(1)},${f.align.ty.toFixed(1)}`).join(' | ')
+  );
+  return summary;
+}
+
+/**
+ * Draws frame f's photo aligned to the reference grid into a dw x dh area
+ * at the canvas origin.
+ */
+function drawAligned(ctx, f, dw = f.width, dh = f.height) {
+  const { s, tx, ty } = f.align || { s: 1, tx: 0, ty: 0 };
+  const k = dw / f.width;
+  const ky = dh / f.height;
+  const cx = (f.width - 1) / 2;
+  const cy = (f.height - 1) / 2;
+  ctx.save();
+  // image pixel p_k lands at reference point (p_k - c - t)/s + c, scaled to the target
+  ctx.transform(k / s, 0, 0, ky / s, k * (cx - (cx + tx) / s), ky * (cy - (cy + ty) / s));
+  ctx.drawImage(f.img, 0, 0, f.width, f.height);
+  ctx.restore();
+}
+
+/** Aligned frame as RGBA ImageData at a reduced size (for superpixels). */
+function alignedImageData(f, lw, lh) {
+  const c = document.createElement('canvas');
+  c.width = lw;
+  c.height = lh;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.fillStyle = '#000';
+  cx.fillRect(0, 0, lw, lh);
+  drawAligned(cx, f, lw, lh);
+  return cx.getImageData(0, 0, lw, lh);
+}
+
+// ---- superpixels.js ----
+// SLIC superpixels: splits the photo into compact regions of similar colour
+// that follow object edges. The depth map assigns one depth per region, so
+// colours stop at object outlines and plain areas can be filled from their
+// neighbours.
+
+const SP_COMPACTNESS = 10; // higher = more regular, less edge-hugging regions
+
+/** sRGB RGBA -> CIE Lab (D65), Float32Array [L, a, b] per pixel. */
+function spToLab(rgba, n) {
+  const lin = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const c = i / 255;
+    lin[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const lab = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const r = lin[rgba[i * 4]];
+    const g = lin[rgba[i * 4 + 1]];
+    const b = lin[rgba[i * 4 + 2]];
+    const fx = f((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047);
+    const fy = f(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    const fz = f((0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883);
+    lab[i * 3] = 116 * fy - 16;
+    lab[i * 3 + 1] = 500 * (fx - fy);
+    lab[i * 3 + 2] = 200 * (fy - fz);
+  }
+  return lab;
+}
+
+/**
+ * rgba: ImageData-like {data, width, height}; step: region spacing in px.
+ * Returns {labels: Int32Array, count, lab: Float32Array(count*3), size: Int32Array}.
+ */
+function slic({ data, width: w, height: h }, step, iters = 6) {
+  const n = w * h;
+  const lab = spToLab(data, n);
+
+  // seeds on a grid, nudged to the lowest-gradient pixel nearby (not on an edge)
+  const seeds = [];
+  const L = (x, y) => lab[(y * w + x) * 3];
+  for (let y = step >> 1; y < h; y += step) {
+    for (let x = step >> 1; x < w; x += step) {
+      let bx = x;
+      let by = y;
+      let best = Infinity;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 1 || yy < 1 || xx >= w - 1 || yy >= h - 1) continue;
+          const g = Math.abs(L(xx + 1, yy) - L(xx - 1, yy)) + Math.abs(L(xx, yy + 1) - L(xx, yy - 1));
+          if (g < best) {
+            best = g;
+            bx = xx;
+            by = yy;
+          }
+        }
+      }
+      const i = (by * w + bx) * 3;
+      seeds.push(bx, by, lab[i], lab[i + 1], lab[i + 2]);
+    }
+  }
+  const K = seeds.length / 5;
+  const C = Float64Array.from(seeds);
+  const labels = new Int32Array(n).fill(-1);
+  const dist = new Float32Array(n);
+  const spatial = (SP_COMPACTNESS / step) ** 2;
+  const sums = new Float64Array(K * 6);
+
+  for (let it = 0; it < iters; it++) {
+    dist.fill(Infinity);
+    for (let k = 0; k < K; k++) {
+      const cx = C[k * 5];
+      const cy = C[k * 5 + 1];
+      const cl = C[k * 5 + 2];
+      const ca = C[k * 5 + 3];
+      const cb = C[k * 5 + 4];
+      const x0 = Math.max(0, Math.floor(cx - step));
+      const x1 = Math.min(w - 1, Math.ceil(cx + step));
+      const y0 = Math.max(0, Math.floor(cy - step));
+      const y1 = Math.min(h - 1, Math.ceil(cy + step));
+      for (let y = y0; y <= y1; y++) {
+        const dy2 = (y - cy) ** 2;
+        for (let x = x0; x <= x1; x++) {
+          const i = y * w + x;
+          const dl = lab[i * 3] - cl;
+          const da = lab[i * 3 + 1] - ca;
+          const db = lab[i * 3 + 2] - cb;
+          const D = dl * dl + da * da + db * db + ((x - cx) ** 2 + dy2) * spatial;
+          if (D < dist[i]) {
+            dist[i] = D;
+            labels[i] = k;
+          }
+        }
+      }
+    }
+    sums.fill(0);
+    for (let i = 0; i < n; i++) {
+      const k = labels[i];
+      if (k < 0) continue;
+      const o = k * 6;
+      sums[o] += i % w;
+      sums[o + 1] += (i / w) | 0;
+      sums[o + 2] += lab[i * 3];
+      sums[o + 3] += lab[i * 3 + 1];
+      sums[o + 4] += lab[i * 3 + 2];
+      sums[o + 5]++;
+    }
+    for (let k = 0; k < K; k++) {
+      const cnt = sums[k * 6 + 5];
+      if (!cnt) continue;
+      for (let j = 0; j < 5; j++) C[k * 5 + j] = sums[k * 6 + j] / cnt;
+    }
+  }
+
+  // connectivity: every region must be one connected piece; small stray
+  // fragments are merged into the region on their left/top
+  const out = new Int32Array(n).fill(-1);
+  const stack = new Int32Array(n);
+  const members = new Int32Array(n);
+  const minSize = (step * step) >> 2;
+  let next = 0;
+  for (let i = 0; i < n; i++) {
+    if (out[i] >= 0) continue;
+    const old = labels[i];
+    const x = i % w;
+    const adj = x > 0 && out[i - 1] >= 0 ? out[i - 1] : i >= w && out[i - w] >= 0 ? out[i - w] : -1;
+    let sp = 0;
+    let cnt = 0;
+    stack[sp++] = i;
+    out[i] = next;
+    while (sp) {
+      const j = stack[--sp];
+      members[cnt++] = j;
+      const jx = j % w;
+      if (jx > 0 && out[j - 1] < 0 && labels[j - 1] === old) (out[j - 1] = next), (stack[sp++] = j - 1);
+      if (jx < w - 1 && out[j + 1] < 0 && labels[j + 1] === old) (out[j + 1] = next), (stack[sp++] = j + 1);
+      if (j >= w && out[j - w] < 0 && labels[j - w] === old) (out[j - w] = next), (stack[sp++] = j - w);
+      if (j < n - w && out[j + w] < 0 && labels[j + w] === old) (out[j + w] = next), (stack[sp++] = j + w);
+    }
+    if (cnt < minSize && adj >= 0) {
+      for (let m = 0; m < cnt; m++) out[members[m]] = adj;
+    } else {
+      next++;
+    }
+  }
+
+  // mean colour + size per final region
+  const count = next;
+  const meanLab = new Float32Array(count * 3);
+  const size = new Int32Array(count);
+  for (let i = 0; i < n; i++) {
+    const k = out[i];
+    meanLab[k * 3] += lab[i * 3];
+    meanLab[k * 3 + 1] += lab[i * 3 + 1];
+    meanLab[k * 3 + 2] += lab[i * 3 + 2];
+    size[k]++;
+  }
+  for (let k = 0; k < count; k++) {
+    const s = size[k] || 1;
+    meanLab[k * 3] /= s;
+    meanLab[k * 3 + 1] /= s;
+    meanLab[k * 3 + 2] /= s;
+  }
+  return { labels: out, count, lab: meanLab, size };
+}
+
+/** Neighbour lists (arrays of region ids) from a label image. */
+function regionNeighbours(labels, w, h, count) {
+  const sets = Array.from({ length: count }, () => new Set());
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const a = labels[i];
+      if (x < w - 1 && labels[i + 1] !== a) {
+        sets[a].add(labels[i + 1]);
+        sets[labels[i + 1]].add(a);
+      }
+      if (y < h - 1 && labels[i + w] !== a) {
+        sets[a].add(labels[i + w]);
+        sets[labels[i + w]].add(a);
+      }
+    }
+  }
+  return sets.map((s) => Array.from(s));
+}
+
 // ---- depthmap.js ----
-// Depth map from the focus stack: the frame is split into cells, each cell's
-// sharpness curve across the sweep gives the frame index where it is in focus
-// (= its distance). Textureless cells have no reliable peak, so they get low
-// confidence and fade back to the plain photo instead of showing noise.
+// Depth map from the (aligned) focus stack.
+// 1. Cells: each 16 px cell's sharpness curve across the sweep peaks at the
+//    frame where it is in focus (= its distance); a clear peak on real texture
+//    gives high confidence.
+// 2. Regions: the photo is split into superpixels (colour regions that follow
+//    object edges). Each region takes the confidence-weighted median depth of
+//    the cells under it, so colours stop at object outlines.
+// 3. Plain regions (no texture -> no focus information) are filled from
+//    similar-coloured neighbours and drawn fainter, as estimates.
+
 
 const DM_TILE = 16; // analysis-frame pixels per depth cell
 const DM_CONF_MIN = 0.25; // cells below this don't vote in the outlier filter
+const DM_LOW_W = 360; // superpixel image width
+const DM_SP_STEP = 14; // superpixel spacing (low-res px)
+const DM_BINS = 64; // depth histogram bins per region
+const DM_KNOWN = 0.15; // region mean confidence needed to count as measured
+const DM_COLOR_SIGMA = 14; // Lab distance scale for "similar colour"
 
 /** Turbo colormap (Google, polynomial approximation), x in 0..1 -> [r,g,b] 0..255. */
 function turbo(x) {
@@ -996,11 +1514,8 @@ function median(arr) {
   return s[s.length >> 1];
 }
 
-/**
- * frames: sorted far -> near (ascending diopter), each {gray, width, height, diopter}.
- * Returns {gw, gh, t, alpha, baseIndex, overlay} where t is 0 (far)..1 (near).
- */
-function computeDepthMap(frames) {
+/** Per-cell focus position t (0 far..1 near), confidence and the base frame. */
+function measureCells(frames) {
   const n = frames.length;
   const { width: w, height: h } = frames[0];
   const gw = Math.floor(w / DM_TILE);
@@ -1022,7 +1537,7 @@ function computeDepthMap(frames) {
     }
   }
 
-  // per-cell focus peak (fractional frame index) + confidence
+  // per-cell focus peak (fractional frame index)
   const idx = new Float32Array(cells);
   const ratio = new Float32Array(cells);
   const peakE = new Float32Array(cells);
@@ -1056,7 +1571,7 @@ function computeDepthMap(frames) {
   }
 
   // 3x3 median of confident neighbours removes single-cell outliers
-  const clean = new Float32Array(idx);
+  const t = new Float32Array(cells);
   const buf = [];
   for (let y = 0; y < gh; y++) {
     for (let x = 0; x < gw; x++) {
@@ -1070,58 +1585,146 @@ function computeDepthMap(frames) {
           if (conf[c] >= DM_CONF_MIN) buf.push(idx[c]);
         }
       }
-      if (buf.length >= 3) clean[y * gw + x] = median(buf);
+      const c = y * gw + x;
+      t[c] = (buf.length >= 3 ? median(buf) : idx[c]) / (n - 1);
     }
   }
+  return { gw, gh, t, conf, baseIndex };
+}
 
-  // confidence-weighted smoothing (2 passes): fills gaps from neighbours and
-  // softens the cell grid; alpha follows the local confidence
-  let t = new Float32Array(cells);
-  let alpha = new Float32Array(cells);
-  for (let c = 0; c < cells; c++) {
-    t[c] = clean[c] / (n - 1);
-    alpha[c] = conf[c];
+/** Region depth = confidence-weighted median of the cells under its pixels. */
+function regionDepths(sp, cellsInfo, lw, lh, scale) {
+  const { gw, gh, t, conf } = cellsInfo;
+  const { labels, count } = sp;
+  const hist = new Float32Array(count * DM_BINS);
+  const wsum = new Float32Array(count);
+  for (let y = 0; y < lh; y++) {
+    const cy = Math.min(gh - 1, Math.floor(((y + 0.5) * scale) / DM_TILE));
+    for (let x = 0; x < lw; x++) {
+      const cx = Math.min(gw - 1, Math.floor(((x + 0.5) * scale) / DM_TILE));
+      const c = cy * gw + cx;
+      const wgt = conf[c];
+      if (wgt <= 0) continue;
+      const k = labels[y * lw + x];
+      const bin = Math.min(DM_BINS - 1, Math.floor(t[c] * DM_BINS));
+      hist[k * DM_BINS + bin] += wgt;
+      wsum[k] += wgt;
+    }
   }
-  for (let pass = 0; pass < 2; pass++) {
-    const t2 = new Float32Array(cells);
-    const a2 = new Float32Array(cells);
-    for (let y = 0; y < gh; y++) {
-      for (let x = 0; x < gw; x++) {
-        let wt = 0;
-        let wv = 0;
-        let as = 0;
-        let an = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const xx = x + dx;
-            const yy = y + dy;
-            if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
-            const c = yy * gw + xx;
-            const k = (dx === 0 && dy === 0 ? 2 : 1) * (alpha[c] + 1e-4);
-            wt += k;
-            wv += k * t[c];
-            as += alpha[c];
-            an++;
-          }
-        }
-        const c = y * gw + x;
-        t2[c] = wv / wt;
-        a2[c] = 0.5 * alpha[c] + 0.5 * (as / an);
+  const rt = new Float32Array(count);
+  const rc = new Float32Array(count);
+  for (let k = 0; k < count; k++) {
+    rc[k] = wsum[k] / (sp.size[k] || 1);
+    if (!wsum[k]) continue;
+    let acc = 0;
+    const half = wsum[k] / 2;
+    for (let b = 0; b < DM_BINS; b++) {
+      const v = hist[k * DM_BINS + b];
+      if (acc + v >= half) {
+        rt[k] = (b + (half - acc) / (v || 1)) / DM_BINS;
+        break;
       }
+      acc += v;
     }
-    t = t2;
-    alpha = a2;
+  }
+  return { rt, rc };
+}
+
+const colorSim = (lab, a, b) => {
+  const d2 = (lab[a * 3] - lab[b * 3]) ** 2 + (lab[a * 3 + 1] - lab[b * 3 + 1]) ** 2 + (lab[a * 3 + 2] - lab[b * 3 + 2]) ** 2;
+  return Math.exp(-d2 / (2 * DM_COLOR_SIGMA * DM_COLOR_SIGMA));
+};
+
+/**
+ * Edge-aware smoothing of measured regions + filling of unmeasured ones.
+ * Returns per-region {t, conf, state} with state 2 = measured, 1 = filled, 0 = none.
+ */
+function refineRegions(sp, nb, rt, rc) {
+  const { count, lab } = sp;
+  const state = new Uint8Array(count);
+  for (let k = 0; k < count; k++) if (rc[k] >= DM_KNOWN) state[k] = 2;
+
+  // one pass of smoothing among measured neighbours with similar colour AND
+  // similar depth (so real depth edges stay sharp)
+  const t = new Float32Array(rt);
+  for (let k = 0; k < count; k++) {
+    if (state[k] !== 2) continue;
+    let ws = 2 * rc[k];
+    let vs = 2 * rc[k] * rt[k];
+    for (const j of nb[k]) {
+      if (state[j] !== 2 || Math.abs(rt[j] - rt[k]) > 0.12) continue;
+      const wj = rc[j] * colorSim(lab, k, j);
+      ws += wj;
+      vs += wj * rt[j];
+    }
+    t[k] = vs / ws;
   }
 
-  // Colour range = this scene's own depth span (3rd–97th percentile of the
-  // confident cells), not the lens's whole 10 cm–3.6 m range: a scene at
-  // 25–60 cm otherwise came out almost uniformly yellow-green.
-  let vals = [];
-  for (let c = 0; c < cells; c++) if (alpha[c] > 0.4) vals.push(t[c]);
-  if (vals.length < 10) vals = Array.from(t);
-  vals.sort((a, b) => a - b);
-  let tLo = vals[Math.floor(0.03 * (vals.length - 1))];
-  let tHi = vals[Math.floor(0.97 * (vals.length - 1))];
+  // fill unmeasured regions from similar-coloured neighbours, growing outwards
+  const conf = new Float32Array(rc);
+  for (let it = 0; it < 60; it++) {
+    const updates = [];
+    for (let k = 0; k < count; k++) {
+      if (state[k]) continue;
+      let ws = 0;
+      let vs = 0;
+      let best = 0;
+      for (const j of nb[k]) {
+        if (!state[j]) continue;
+        const wj = Math.max(1e-3, conf[j]) * colorSim(lab, k, j);
+        ws += wj;
+        vs += wj * t[j];
+        best = Math.max(best, wj);
+      }
+      if (ws > 1e-6) updates.push([k, vs / ws, 0.8 * best]);
+    }
+    if (!updates.length) break;
+    for (const [k, v, c] of updates) {
+      t[k] = v;
+      conf[k] = c;
+      state[k] = 1;
+    }
+  }
+  return { t, conf, state };
+}
+
+/**
+ * frames: aligned, sorted far -> near (ascending diopter), each
+ * {gray, width, height, diopter, img}. colorOf(frame, w, h) returns the
+ * aligned photo as RGBA ImageData (injectable for tests).
+ * Returns {overlay, baseIndex, tLo, tHi, stats}.
+ */
+function computeDepthMap(frames, colorOf = alignedImageData) {
+  const { width: w, height: h } = frames[0];
+  const cellsInfo = measureCells(frames);
+
+  const lw = Math.min(w, DM_LOW_W);
+  const lh = Math.round((h * lw) / w);
+  const scale = w / lw;
+  const sp = slic(colorOf(frames[cellsInfo.baseIndex], lw, lh), DM_SP_STEP);
+  const nb = regionNeighbours(sp.labels, lw, lh, sp.count);
+  const { rt, rc } = regionDepths(sp, cellsInfo, lw, lh, scale);
+  const { t, conf, state } = refineRegions(sp, nb, rt, rc);
+
+  // Colour range = this scene's own depth span: 3rd–97th percentile (by area)
+  // of the measured regions, not the lens's whole 10 cm–3.6 m range.
+  const known = [];
+  for (let k = 0; k < sp.count; k++) if (state[k] === 2) known.push(k);
+  if (known.length < 3) for (let k = 0; k < sp.count; k++) if (state[k]) known.push(k);
+  known.sort((a, b) => t[a] - t[b]);
+  let area = 0;
+  for (const k of known) area += sp.size[k];
+  const pct = (p) => {
+    let acc = 0;
+    for (const k of known) {
+      acc += sp.size[k];
+      if (acc >= p * area) return t[k];
+    }
+    return known.length ? t[known[known.length - 1]] : 0.5;
+  };
+  let tLo = pct(0.03);
+  let tHi = pct(0.97);
+  const n = frames.length;
   const minSpan = 3 / (n - 1); // at least 3 sweep steps
   if (tHi - tLo < minSpan) {
     const mid = (tLo + tHi) / 2;
@@ -1129,22 +1732,38 @@ function computeDepthMap(frames) {
     tHi = tLo + minSpan;
   }
 
-  // small RGBA image of the map; scaled up with smoothing when drawn
-  const overlay = document.createElement('canvas');
-  overlay.width = gw;
-  overlay.height = gh;
-  const octx = overlay.getContext('2d');
-  const img = octx.createImageData(gw, gh);
-  for (let c = 0; c < cells; c++) {
-    const [r, g, b] = depthColor((t[c] - tLo) / (tHi - tLo));
-    img.data[c * 4] = r;
-    img.data[c * 4 + 1] = g;
-    img.data[c * 4 + 2] = b;
-    img.data[c * 4 + 3] = Math.round(255 * Math.min(1, alpha[c] * 1.4));
+  // per-region colour + opacity: measured = strong, filled = fainter
+  const rgba = new Uint8ClampedArray(sp.count * 4);
+  let measured = 0;
+  let filled = 0;
+  for (let k = 0; k < sp.count; k++) {
+    const [r, g, b] = depthColor((t[k] - tLo) / (tHi - tLo));
+    let a = 0;
+    if (state[k] === 2) {
+      a = 0.6 + 0.4 * Math.min(1, conf[k] / 0.5);
+      measured += sp.size[k];
+    } else if (state[k] === 1) {
+      a = 0.25 + 0.3 * Math.min(1, conf[k] / 0.3);
+      filled += sp.size[k];
+    }
+    rgba.set([r, g, b, Math.round(255 * a)], k * 4);
   }
+  const overlay = document.createElement('canvas');
+  overlay.width = lw;
+  overlay.height = lh;
+  const octx = overlay.getContext('2d');
+  const img = octx.createImageData(lw, lh);
+  for (let i = 0; i < lw * lh; i++) img.data.set(rgba.subarray(sp.labels[i] * 4, sp.labels[i] * 4 + 4), i * 4);
   octx.putImageData(img, 0, 0);
 
-  return { gw, gh, t, alpha, baseIndex, overlay, tLo, tHi };
+  const total = lw * lh;
+  const stats = {
+    regions: sp.count,
+    measured: measured / total,
+    filled: filled / total,
+    cells: `${cellsInfo.gw}x${cellsInfo.gh}`,
+  };
+  return { overlay, baseIndex: cellsInfo.baseIndex, tLo, tHi, stats };
 }
 
 /** Fractional sweep position t (0 = far frame, 1 = near frame) -> meters. */
@@ -1158,17 +1777,17 @@ function depthToMeters(frames, t) {
 
 /**
  * Paints the depth colours over a dimmed grey photo, then brings the photo's
- * detail back with an "overlay" pass. (A "color" blend kept the photo's own
- * brightness, so white/black areas showed no depth colour and the tint read
- * as the object's real colour.) reveal 0..1 animates a top-down scan.
+ * detail back with an "overlay" pass. reveal 0..1 animates a top-down scan.
  */
 function renderDepth(ctx, frames, map, reveal = 1) {
   const f = frames[map.baseIndex];
   const W = f.width;
   const H = f.height;
   ctx.save();
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
   ctx.filter = 'grayscale(1) brightness(0.6) contrast(1.1)';
-  ctx.drawImage(f.img, 0, 0, W, H);
+  drawAligned(ctx, f);
   ctx.filter = 'none';
 
   const cut = H * reveal;
@@ -1178,11 +1797,11 @@ function renderDepth(ctx, frames, map, reveal = 1) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.globalAlpha = 0.85;
-  ctx.drawImage(map.overlay, 0, 0, map.gw * DM_TILE, map.gh * DM_TILE);
+  ctx.drawImage(map.overlay, 0, 0, W, H);
   ctx.globalAlpha = 0.45;
   ctx.globalCompositeOperation = 'overlay';
   ctx.filter = 'grayscale(1)';
-  ctx.drawImage(f.img, 0, 0, W, H);
+  drawAligned(ctx, f);
   ctx.restore();
 
   if (reveal < 1) {
@@ -1208,6 +1827,7 @@ function depthGradientCss() {
 }
 
 // ---- main.js ----
+
 
 
 
@@ -1436,14 +2056,25 @@ async function enterReview() {
     setStatus('Too few distinct focus steps captured.', 'err');
     return;
   }
+  // let each status paint before the heavy computation that follows it
+  const paint = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+  setStatus('Aligning frames…');
+  await paint();
+  try {
+    const t0 = performance.now();
+    const summary = alignFrames(frames);
+    dlog(`  align took ${Math.round(performance.now() - t0)} ms (${summary})`);
+  } catch (e) {
+    dlog(`ALIGN failed: ${e.name}: ${e.message}`);
+  }
+
   setStatus('Building depth map…');
-  // let the status paint before the heavy computation
-  await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+  await paint();
   depthMap = null;
   try {
     const t0 = performance.now();
     depthMap = computeDepthMap(frames);
-    dlog(`DEPTH map ${depthMap.gw}x${depthMap.gh} cells in ${Math.round(performance.now() - t0)} ms, base frame ${depthMap.baseIndex + 1}`);
+    dlog(`DEPTH map in ${Math.round(performance.now() - t0)} ms, base frame ${depthMap.baseIndex + 1}:`, depthMap.stats);
   } catch (e) {
     dlog(`DEPTH map failed: ${e.name}: ${e.message}`);
   }
@@ -1511,7 +2142,10 @@ function drawFrame(reveal = 1) {
     renderDepth(ctx, frames, depthMap, reveal);
     el.frameLabel.innerHTML = '<b>🌈 Depth map</b>';
   } else {
-    ctx.drawImage(f.img, 0, 0, f.width, f.height);
+    // aligned, so scrubbing doesn't show the lens "breathing" or hand shake
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, f.width, f.height);
+    drawAligned(ctx, f);
     el.frameLabel.innerHTML = `Frame <b>${current + 1}/${frames.length} · focus ${fmtDist(f.distance)}</b>`;
   }
   el.depthLegend.classList.toggle('hidden', !depth);
